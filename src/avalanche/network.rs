@@ -37,7 +37,7 @@ impl NetworkHandler {
     /// following things happen:
     /// - an error occurrs
     /// - the connection is closed
-    pub fn read_bytes(&mut self) -> Result<(), Box<dyn Error>> {
+    pub async fn read_bytes(mut self) -> Result<Self, Box<dyn Error + Send>> {
         let mut buffer = [0u8; 1024];
 
         loop {
@@ -58,7 +58,7 @@ impl NetworkHandler {
         }
 
         self.set_disconnection_instant();
-        Ok(())
+        Ok(self)
     }
 
     /// Returns the status of the connection (connected or disconnected).
