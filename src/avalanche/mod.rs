@@ -4,6 +4,8 @@ pub mod network;
 
 /// It represents all the possible statuses for a P2P connection.
 pub enum ConnectionStatus {
+    /// Connection has not been established yet.
+    NotStarted(),
     /// The connection has been established and is currently open.
     /// It includes also the elapsed time (from the instant in which
     /// the connection was established until now).
@@ -18,6 +20,7 @@ pub enum ConnectionStatus {
 impl Display for ConnectionStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::NotStarted() => write!(f, "Not connected yet"),
             Self::Connected(elapsed_time) => {
                 write!(f, "Connected for {} seconds", elapsed_time.as_secs())
             }
