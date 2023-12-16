@@ -2,45 +2,70 @@ use std::{
     error::Error,
     io::{ErrorKind, Read},
     net::TcpStream,
-    sync::mpsc,
+    sync::{mpsc, Arc},
     thread::sleep,
     time::{Duration, Instant},
 };
 
+use rustls::{Certificate, ClientConnection, PrivateKey, StreamOwned};
+use tokio::sync::Mutex;
+
 use super::ConnectionStatus;
 
 pub struct NetworkHandler {
+    /// Certificate for the TLS connection
+    certificate: Certificate,
+
     /// A pair storing the instant in which the connection was established
     /// and the instant in which it was closed. It is useful for
     /// computing the connection duration.
     connection_instants: (Option<Instant>, Option<Instant>),
 
+    /// Private key for the TLS connection.
+    private_key: PrivateKey,
+
     /// MPSC channel sender to periodically report information about
     /// the connection status.
     status_update_sender: mpsc::Sender<ConnectionStatus>,
 
-    /// Network stream for read/write operations.
-    stream: Option<TcpStream>,
+    /// TLS stream for read/write operations.
+    tls_stream: Arc<Mutex<Option<StreamOwned<ClientConnection, TcpStream>>>>,
 }
 
 impl NetworkHandler {
-    pub fn new(sender: mpsc::Sender<ConnectionStatus>) -> Self {
-        Self {
+    pub fn new(sender: mpsc::Sender<ConnectionStatus>) -> Result<Self, Box<dyn Error>> {
+        // Generate a private key and a certificate for establishing the TLS connection
+        let (private_key, certificate) = cert_manager::x509::generate_der(None)?;
+
+        Ok(Self {
+            certificate,
             connection_instants: (None, None),
+            private_key,
             status_update_sender: sender,
-            stream: None,
-        }
+            tls_stream: Arc::new(Mutex::new(None)),
+        })
     }
 
     /// Starts a connection to the destination_address and returns a [`NetworkHandler`]
     /// instance. If the connection fails, an error is returned instead.
     pub fn connect(&mut self, destination_address: &str) -> Result<(), Box<dyn Error>> {
-        self.stream = Some(TcpStream::connect(destination_address)?);
+        // Extract the IP address from the destination address ([IP]:[PORT])
+        // TODO: better error handling
+        let (ip_address, _) = destination_address.split_once(':').unwrap();
+
+        let tls_connection = tls::get_tls_connection(
+            ip_address,
+            self.private_key.clone(),
+            self.certificate.clone(),
+        )
+        .unwrap();
+        let stream = TcpStream::connect(destination_address)?;
+        // Set the stream as non-blocking when performing read/write operations
+        stream.set_nonblocking(true)?;
+
+        self.tls_stream = Arc::new(Mutex::new(Some(StreamOwned::new(tls_connection, stream))));
         self.connection_instants = (Some(Instant::now()), None);
         _ = self.status_update_sender.send(self.connection_status());
-
-        // Set the stream as non-blocking when performing read/write operations
-        self.stream.as_mut().unwrap().set_nonblocking(true)?;
 
         Ok(())
     }
@@ -51,28 +76,28 @@ impl NetworkHandler {
     /// - the connection is closed
     pub async fn read_bytes(mut self) -> Result<Self, Box<dyn Error + Send>> {
         let mut buffer = [0u8; 1024];
-        let stream = self.stream.as_mut().unwrap();
+        let stream = self.tls_stream.clone();
 
         loop {
             sleep(Duration::from_millis(100));
 
-            match stream.read(&mut buffer) {
-                // EOF, connection closed
-                Ok(0) => break,
-                Ok(read_bytes) => println!("Read {} bytes from the socket", read_bytes),
-                // WouldBlock is returned by non-blocking streams when there is no data to read yet
-                Err(error) if error.kind() == ErrorKind::WouldBlock => {}
-                Err(error) => {
-                    println!("Unexpected stream error: {:?}", error);
-                    self.set_disconnection_instant();
-                    _ = self.status_update_sender.send(self.connection_status());
-                    return Err(Box::new(error));
+            if let Some(stream) = stream.lock().await.as_mut() {
+                match stream.read(&mut buffer) {
+                    // EOF, connection closed
+                    Ok(0) => break,
+                    Ok(read_bytes) => println!("Read {} bytes from the socket", read_bytes),
+                    // WouldBlock is returned by non-blocking streams when there is no data to read yet
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+                    Err(error) => {
+                        println!("Unexpected stream error: {:?}", error);
+                        self.set_disconnection_instant();
+                        return Err(Box::new(error));
+                    }
                 }
             }
         }
 
         self.set_disconnection_instant();
-        _ = self.status_update_sender.send(self.connection_status());
         Ok(self)
     }
 
@@ -95,5 +120,66 @@ impl NetworkHandler {
     fn set_disconnection_instant(&mut self) {
         let (_, disconnection_instant) = &mut self.connection_instants;
         *disconnection_instant = Some(Instant::now());
+
+        // Notify the eventual receiver
+        _ = self.status_update_sender.send(self.connection_status());
+    }
+}
+
+/// Module containing helper functions to setup TLS connections.
+mod tls {
+    use std::{error::Error, sync::Arc, time::SystemTime};
+
+    use rustls::{
+        client::ServerCertVerifier, Certificate, ClientConfig, ClientConnection, PrivateKey,
+        ServerName,
+    };
+
+    /// Initializes a TLS connection configuration to connect to Avalanche nodes.
+    pub fn get_tls_connection(
+        ip_address: &str,
+        private_key: PrivateKey,
+        certificate: Certificate,
+    ) -> Result<ClientConnection, Box<dyn Error>> {
+        let server_name = ServerName::try_from(ip_address)?;
+
+        // Prepare a basic configuration
+        let config = Arc::new(get_default_tls_config((
+            private_key.clone(),
+            certificate.clone(),
+        ))?);
+
+        Ok(ClientConnection::new(config, server_name)?)
+    }
+
+    /// Returns a basic configuration to establish a TLS connection.
+    /// This shouldn't be used in production as, for instance,
+    /// the certificate verification is disable (see [`NoCertificateVerification`]).
+    fn get_default_tls_config(
+        (private_key, certificate): (PrivateKey, Certificate),
+    ) -> Result<ClientConfig, String> {
+        rustls::ClientConfig::builder()
+            .with_safe_defaults()
+            .with_custom_certificate_verifier(Arc::new(NoCertificateVerification {}))
+            .with_client_auth_cert(vec![certificate], private_key)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Mock struct to disable the verification of TLS certificates.
+    /// This is needed as Avalanche nodes may have self-signed certificates.
+    struct NoCertificateVerification {}
+
+    impl ServerCertVerifier for NoCertificateVerification {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &Certificate,
+            _intermediates: &[Certificate],
+            _server_name: &ServerName,
+            _scts: &mut dyn Iterator<Item = &[u8]>,
+            _ocsp_response: &[u8],
+            _now: SystemTime,
+        ) -> std::result::Result<rustls::client::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::ServerCertVerified::assertion())
+        }
     }
 }

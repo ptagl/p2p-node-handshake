@@ -12,7 +12,16 @@ async fn main() {
     let (sender, receiver) = mpsc::channel::<ConnectionStatus>();
 
     // Create an object that will handle the network communication
-    let mut network_handler = NetworkHandler::new(sender);
+    let mut network_handler = match NetworkHandler::new(sender) {
+        Ok(handler) => handler,
+        Err(error) => {
+            println!(
+                "An error occurred while creating the network handler: {:?}",
+                error
+            );
+            return;
+        }
+    };
 
     // Try to connect to the Avalanche node
     match network_handler.connect("127.0.0.1:9651") {
