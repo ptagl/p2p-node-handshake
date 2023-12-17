@@ -7,6 +7,13 @@ use std::{fmt::Display, time::Duration};
 
 use tokio::task::JoinError;
 
+/// Size in bytes of the P2P message header.
+const MESSAGE_HEADER_LENGTH: usize = 4;
+
+/// This constant is to prevent DoS attacks from malicious nodes.
+/// For instance, we don't want to parse a message whose size is 10 GB and make the application crash.
+const MAX_MESSAGE_LENGTH: usize = 1024 * 1024 * 4; // 4 MB
+
 /// P2P errors handled by the network layer.
 #[derive(Debug)]
 pub enum P2pError {
@@ -18,6 +25,8 @@ pub enum P2pError {
     ConnectionError(String, String),
     /// Unable to convert the string into a valid [IP]:[PORT] pair.
     InvalidAddress(String),
+    /// The P2P message size exceeds the max limit allowed.
+    InvalidMessageSize(usize, usize),
     /// Unable to convert the IP address into a server name for the TLS connection.
     InvalidServerName(String),
     /// Error while configuring the socket stream.
@@ -50,6 +59,11 @@ impl Display for P2pError {
                 f,
                 "Unable to parse ip address and port, expected [ip]:[port], found {}",
                 destination_address
+            ),
+            Self::InvalidMessageSize(message_size, max_message_size) => write!(
+                f,
+                "Message size ({} bytes) exceeded max allowed ({} bytes)",
+                message_size, max_message_size
             ),
             Self::InvalidServerName(server_name) => {
                 write!(f, "Unable to parse server name, input is: {}", server_name)
@@ -90,7 +104,7 @@ impl Display for ConnectionStatus {
             Self::NotStarted() => write!(f, "Not connected yet"),
             Self::Connected(elapsed_time) => {
                 write!(f, "Connected for {} seconds", elapsed_time.as_secs())
-            },
+            }
             Self::Closed(total_time) => write!(f, "Closed after {} seconds", total_time.as_secs()),
         }
     }

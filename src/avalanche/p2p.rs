@@ -1,9 +1,16 @@
 use std::{
-    sync::mpsc::{self, Receiver, TryRecvError},
+    net::Ipv6Addr,
+    sync::mpsc::{self, TryRecvError},
     time::Duration,
 };
 
-use super::{network::NetworkHandler, ConnectionStatus, P2pError};
+use super::{
+    network::{avalanche, NetworkHandler},
+    ConnectionStatus, P2pError,
+};
+
+type ReceivedMessageQueue = mpsc::Receiver<avalanche::Message>;
+type StatusUpdateQueue = mpsc::Receiver<ConnectionStatus>;
 
 /// It handles the communication with Avalanche nodes.
 pub struct AvalancheClient {
@@ -14,22 +21,31 @@ pub struct AvalancheClient {
     /// It is an Option as it must be moved when running asynchronously.
     network_handler: Option<NetworkHandler>,
 
-    status_update_receiver: Receiver<ConnectionStatus>,
+    /// The queue of messages received from the network layer and waiting to be processed.
+    received_message_queue: ReceivedMessageQueue,
+
+    /// The queue of status updates from the network layer.
+    status_update_queue: StatusUpdateQueue,
 }
 
 impl AvalancheClient {
     /// Creates a new client instance to later connect to the destination address provided.
     pub fn new(destination_address: &str) -> Result<Self, P2pError> {
-        // Let's use a channel to share information
-        let (sender, receiver) = mpsc::channel::<ConnectionStatus>();
+        // Received messages channel
+        let (received_messages_sender, received_message_receiver) =
+            mpsc::channel::<avalanche::Message>();
+
+        // Status update channel
+        let (status_sender, status_receiver) = mpsc::channel::<ConnectionStatus>();
 
         // Create an object that will handle the network communication
-        let network_handler = NetworkHandler::new(sender)?;
+        let network_handler = NetworkHandler::new(received_messages_sender, status_sender)?;
 
         Ok(Self {
             destination_address: destination_address.to_string(),
             network_handler: Some(network_handler),
-            status_update_receiver: receiver,
+            received_message_queue: received_message_receiver,
+            status_update_queue: status_receiver,
         })
     }
 
@@ -56,7 +72,18 @@ impl AvalancheClient {
         loop {
             tokio::time::sleep(Duration::from_millis(100)).await;
 
-            match self.status_update_receiver.try_recv() {
+            // Check if there is any incoming message to be processed
+            match self.received_message_queue.try_recv() {
+                // Process the incoming message
+                Ok(message) => self.process_message(message),
+                // No message yet, nothing to do
+                Err(TryRecvError::Empty) => {}
+                // We won't receive any new message
+                Err(TryRecvError::Disconnected) => break,
+            }
+
+            // Check if there is any status update
+            match self.status_update_queue.try_recv() {
                 Ok(status) => {
                     println!("Connection status: {}", status);
 
@@ -65,8 +92,8 @@ impl AvalancheClient {
                         break;
                     }
                 }
-                // No message yet, retry
-                Err(TryRecvError::Empty) => continue,
+                // No update yet, nothing to do
+                Err(TryRecvError::Empty) => {}
                 // We won't receive any new status update
                 Err(TryRecvError::Disconnected) => break,
             }
@@ -79,6 +106,44 @@ impl AvalancheClient {
             Ok(Ok(_)) => Ok(self),
             Ok(Err(error)) => Err(error), // read error
             Err(error) => Err(P2pError::AsyncOperationError(error)), // Future error
+        }
+    }
+
+    /// Handles an incoming P2P message read from the network
+    fn process_message(&self, message_wrapper: avalanche::Message) {
+        match message_wrapper.message {
+            // Version is the first message sent by P2P nodes when performing the handshaking
+            Some(avalanche::message::Message::Version(version_message)) => {
+                println!(
+                    "Connection established with Avalanche node {}:{}",
+                    Ipv6Addr::from(TryInto::<[u8; 16]>::try_into(version_message.ip_addr).unwrap()),
+                    version_message.ip_port
+                );
+                println!("Received version message");
+
+                // TODO: send a reply message
+            }
+            // The Ping message is periodically sent to show that the node is alive and connected
+            Some(avalanche::message::Message::Ping(ping_message)) => {
+                println!(
+                    "Received ping message, node uptime: {}",
+                    ping_message.uptime
+                );
+
+                let mut message_wrapper = avalanche::Message::new();
+                message_wrapper.set_pong(avalanche::Pong::new());
+
+                println!("Sending pong message");
+                // TODO: send message
+            }
+            // Pong messages are sent as a reply to Ping ones
+            Some(avalanche::message::Message::Pong(_)) => {
+                println!("Received pong message");
+            }
+            // Messages that are not handled yet are printed here
+            x => {
+                println!("Received unknown message: {:?}", x);
+            }
         }
     }
 }
