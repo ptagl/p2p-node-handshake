@@ -27,7 +27,7 @@ async fn main() {
     match network_handler.connect("127.0.0.1:9651") {
         Ok(_) => {}
         Err(error) => {
-            println!("An error occurred while connecting to peer: {:?}", error);
+            println!("An error occurred while connecting to peer: {}", error);
             return;
         }
     };

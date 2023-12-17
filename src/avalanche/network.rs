@@ -10,7 +10,7 @@ use std::{
 use rustls::{Certificate, ClientConnection, PrivateKey, StreamOwned};
 use tokio::sync::Mutex;
 
-use super::ConnectionStatus;
+use super::{ConnectionStatus, P2pError};
 
 pub struct NetworkHandler {
     /// Certificate for the TLS connection
@@ -33,9 +33,10 @@ pub struct NetworkHandler {
 }
 
 impl NetworkHandler {
-    pub fn new(sender: mpsc::Sender<ConnectionStatus>) -> Result<Self, Box<dyn Error>> {
+    pub fn new(sender: mpsc::Sender<ConnectionStatus>) -> Result<Self, P2pError> {
         // Generate a private key and a certificate for establishing the TLS connection
-        let (private_key, certificate) = cert_manager::x509::generate_der(None)?;
+        let (private_key, certificate) = cert_manager::x509::generate_der(None)
+            .map_err(|error| P2pError::CertificateGenerationError(error.to_string()))?;
 
         Ok(Self {
             certificate,
@@ -48,20 +49,26 @@ impl NetworkHandler {
 
     /// Starts a connection to the destination_address and returns a [`NetworkHandler`]
     /// instance. If the connection fails, an error is returned instead.
-    pub fn connect(&mut self, destination_address: &str) -> Result<(), Box<dyn Error>> {
+    pub fn connect(&mut self, destination_address: &str) -> Result<(), P2pError> {
         // Extract the IP address from the destination address ([IP]:[PORT])
-        // TODO: better error handling
-        let (ip_address, _) = destination_address.split_once(':').unwrap();
+        let (ip_address, _) = destination_address
+            .split_once(':')
+            .ok_or_else(|| P2pError::InvalidAddress(destination_address.to_string()))?;
 
         let tls_connection = tls::get_tls_connection(
             ip_address,
             self.private_key.clone(),
             self.certificate.clone(),
-        )
-        .unwrap();
-        let stream = TcpStream::connect(destination_address)?;
+        )?;
+        let stream = TcpStream::connect(destination_address).map_err(|error| {
+            P2pError::ConnectionError(destination_address.to_string(), error.to_string())
+        })?;
         // Set the stream as non-blocking when performing read/write operations
-        stream.set_nonblocking(true)?;
+        stream.set_nonblocking(true).map_err(|error| {
+            // Try to close the stream
+            _ = stream.shutdown(std::net::Shutdown::Both);
+            P2pError::StreamConfigurationError(error.to_string())
+        })?;
 
         self.tls_stream = Arc::new(Mutex::new(Some(StreamOwned::new(tls_connection, stream))));
         self.connection_instants = (Some(Instant::now()), None);
@@ -94,6 +101,8 @@ impl NetworkHandler {
                         return Err(Box::new(error));
                     }
                 }
+            } else {
+                panic!("Unexpected error: tls_stream Option was None!!!");
             }
         }
 
@@ -128,28 +137,34 @@ impl NetworkHandler {
 
 /// Module containing helper functions to setup TLS connections.
 mod tls {
-    use std::{error::Error, sync::Arc, time::SystemTime};
+    use std::{sync::Arc, time::SystemTime};
 
     use rustls::{
         client::ServerCertVerifier, Certificate, ClientConfig, ClientConnection, PrivateKey,
         ServerName,
     };
 
+    use crate::avalanche::P2pError;
+
     /// Initializes a TLS connection configuration to connect to Avalanche nodes.
     pub fn get_tls_connection(
         ip_address: &str,
         private_key: PrivateKey,
         certificate: Certificate,
-    ) -> Result<ClientConnection, Box<dyn Error>> {
-        let server_name = ServerName::try_from(ip_address)?;
+    ) -> Result<ClientConnection, P2pError> {
+        let server_name = ServerName::try_from(ip_address)
+            .map_err(|error| P2pError::InvalidServerName(error.to_string()))?;
 
         // Prepare a basic configuration
-        let config = Arc::new(get_default_tls_config((
-            private_key.clone(),
-            certificate.clone(),
-        ))?);
+        let config = Arc::new(
+            get_default_tls_config((private_key.clone(), certificate.clone())).map_err(
+                |error| P2pError::TlsConfigurationError(ip_address.to_string(), error.to_string()),
+            )?,
+        );
 
-        Ok(ClientConnection::new(config, server_name)?)
+        Ok(ClientConnection::new(config, server_name).map_err(|error| {
+            P2pError::TlsConfigurationError(ip_address.to_string(), error.to_string())
+        }))?
     }
 
     /// Returns a basic configuration to establish a TLS connection.
