@@ -1,9 +1,7 @@
 use std::{
-    error::Error,
     io::{ErrorKind, Read},
     net::TcpStream,
     sync::{mpsc, Arc},
-    thread::sleep,
     time::{Duration, Instant},
 };
 
@@ -81,12 +79,12 @@ impl NetworkHandler {
     /// following things happen:
     /// - an error occurrs
     /// - the connection is closed
-    pub async fn read_bytes(mut self) -> Result<Self, Box<dyn Error + Send>> {
+    pub async fn read_bytes(mut self) -> Result<Self, P2pError> {
         let mut buffer = [0u8; 1024];
         let stream = self.tls_stream.clone();
 
         loop {
-            sleep(Duration::from_millis(100));
+            tokio::time::sleep(Duration::from_millis(100)).await;
 
             if let Some(stream) = stream.lock().await.as_mut() {
                 match stream.read(&mut buffer) {
@@ -98,7 +96,7 @@ impl NetworkHandler {
                     Err(error) => {
                         println!("Unexpected stream error: {:?}", error);
                         self.set_disconnection_instant();
-                        return Err(Box::new(error));
+                        return Err(P2pError::StreamError(error.to_string()));
                     }
                 }
             } else {

@@ -1,10 +1,17 @@
+pub mod network;
+
+mod p2p;
+pub use p2p::AvalancheClient;
+
 use std::{fmt::Display, time::Duration};
 
-pub mod network;
+use tokio::task::JoinError;
 
 /// P2P errors handled by the network layer.
 #[derive(Debug)]
 pub enum P2pError {
+    /// Error occurred while waiting for an async network task.
+    AsyncOperationError(JoinError),
     // Error while trying to generate a certificate for the TLS connection.
     CertificateGenerationError(String),
     /// Error while trying to establish a connection with the remote node.
@@ -15,6 +22,8 @@ pub enum P2pError {
     InvalidServerName(String),
     /// Error while configuring the socket stream.
     StreamConfigurationError(String),
+    /// Unexpected error in the TCP stream.
+    StreamError(String),
     /// Unable to initialize the TLS configuration for the connection.
     TlsConfigurationError(String, String),
 }
@@ -22,6 +31,11 @@ pub enum P2pError {
 impl Display for P2pError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::AsyncOperationError(error) => write!(
+                f,
+                "Async error while waiting for task completion: {}",
+                error
+            ),
             Self::CertificateGenerationError(error_message) => write!(
                 f,
                 "Unable to generate a valid certificate for TLS connection: {}",
@@ -41,6 +55,9 @@ impl Display for P2pError {
                 write!(f, "Unable to parse server name, input is: {}", server_name)
             }
             Self::StreamConfigurationError(error_message) => {
+                write!(f, "Stream configuration error: {}", error_message)
+            }
+            Self::StreamError(error_message) => {
                 write!(f, "Stream error: {}", error_message)
             }
             Self::TlsConfigurationError(ip_address, error_message) => write!(
@@ -73,7 +90,7 @@ impl Display for ConnectionStatus {
             Self::NotStarted() => write!(f, "Not connected yet"),
             Self::Connected(elapsed_time) => {
                 write!(f, "Connected for {} seconds", elapsed_time.as_secs())
-            }
+            },
             Self::Closed(total_time) => write!(f, "Closed after {} seconds", total_time.as_secs()),
         }
     }
