@@ -5,17 +5,20 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use protobuf::Message;
 use rustls::PrivateKey;
 use x509_certificate::Signer;
+use zstd::bulk::decompress;
 
 use super::{
     network::{avalanche, NetworkHandler},
-    ConnectionStatus, P2pError,
+    ConnectionStatus, P2pError, MAX_MESSAGE_LENGTH,
 };
 
 type ReceivedMessageQueue = mpsc::Receiver<avalanche::Message>;
 type SendMessageQueue = mpsc::Sender<avalanche::Message>;
-type StatusUpdateQueue = mpsc::Receiver<ConnectionStatus>;
+type StatusUpdateReceiver = mpsc::Receiver<ConnectionStatus>;
+type StatusUpdateSender = mpsc::Sender<ConnectionStatus>;
 
 /// It handles the communication with Avalanche nodes.
 pub struct AvalancheClient {
@@ -33,10 +36,14 @@ pub struct AvalancheClient {
     /// The queue of messages received from the network layer and waiting to be processed.
     received_message_queue: ReceivedMessageQueue,
 
+    /// The queue of messages that are ready to be serialized and sent through the network.
     send_message_queue: SendMessageQueue,
 
-    /// The queue of status updates from the network layer.
-    status_update_queue: StatusUpdateQueue,
+    /// The queue of status updates from the network layer (receiver).
+    status_update_receiver: StatusUpdateReceiver,
+
+    /// The queue of status updates from the network layer (sender).
+    status_update_sender: StatusUpdateSender,
 }
 
 impl AvalancheClient {
@@ -62,7 +69,7 @@ impl AvalancheClient {
             certificate,
             received_messages_sender,
             send_messages_receiver,
-            status_sender,
+            status_sender.clone(),
         )?;
 
         Ok(Self {
@@ -71,7 +78,8 @@ impl AvalancheClient {
             private_key,
             received_message_queue: received_message_receiver,
             send_message_queue: send_messages_sender,
-            status_update_queue: status_receiver,
+            status_update_receiver: status_receiver,
+            status_update_sender: status_sender,
         })
     }
 
@@ -97,19 +105,24 @@ impl AvalancheClient {
             tokio::time::sleep(Duration::from_millis(100)).await;
 
             // Check if there is any incoming message to be processed
-            match self.received_message_queue.try_recv() {
+            let process_result = match self.received_message_queue.try_recv() {
                 // Process the incoming message
                 Ok(message) => self.process_message(message),
                 // No message yet, nothing to do
-                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Empty) => Ok(()),
                 // We won't receive any new message
                 Err(TryRecvError::Disconnected) => break,
+            };
+
+            match process_result {
+                Ok(_) => {}
+                Err(error) => println!("Process message error: {}", error),
             }
 
             // Check if there is any status update
-            match self.status_update_queue.try_recv() {
+            match self.status_update_receiver.try_recv() {
                 Ok(status) => {
-                    println!("Connection status: {}", status);
+                    println!("[Status Update]{}", status);
 
                     // No further messages after the "Connection closed" event
                     if let ConnectionStatus::Closed(_) = status {
@@ -120,7 +133,7 @@ impl AvalancheClient {
                 Err(TryRecvError::Empty) => {}
                 // We won't receive any new status update
                 Err(TryRecvError::Disconnected) => break,
-            }
+            };
         }
 
         // If the execution reaches this point, the TLS connection was closed,
@@ -134,7 +147,7 @@ impl AvalancheClient {
     }
 
     /// Handles an incoming P2P message read from the network
-    fn process_message(&self, message_wrapper: avalanche::Message) {
+    fn process_message(&self, message_wrapper: avalanche::Message) -> Result<(), P2pError> {
         match message_wrapper.message {
             // Version is the first message sent by P2P nodes when performing the handshaking
             Some(avalanche::message::Message::Version(version_message)) => {
@@ -144,6 +157,10 @@ impl AvalancheClient {
                     version_message.ip_port
                 );
                 println!("Received version message");
+
+                _ = self
+                    .status_update_sender
+                    .send(ConnectionStatus::HandshakeStarted(SystemTime::now().into()));
 
                 let mut message_wrapper = avalanche::Message::new();
                 message_wrapper.set_version(self.version_message());
@@ -157,6 +174,39 @@ impl AvalancheClient {
                 let mut message_wrapper = avalanche::Message::new();
                 message_wrapper.set_peer_list(avalanche::PeerList::new());
                 _ = self.send_message_queue.send(message_wrapper);
+            }
+            // Message containing the peers known by the remote node
+            Some(avalanche::message::Message::PeerList(peer_list)) => {
+                println!(
+                    "Received peer list from the node: {} entries",
+                    peer_list.claimed_ip_ports.len()
+                );
+
+                // No ack is required in case the peer list is empty
+                if !peer_list.claimed_ip_ports.is_empty() {
+                    let mut ack_message = avalanche::PeerListAck::new();
+
+                    peer_list.claimed_ip_ports.iter().for_each(|peer| {
+                        let mut peer_ack = avalanche::PeerAck::new();
+                        peer_ack.timestamp = peer.timestamp;
+                        peer_ack.tx_id = peer.tx_id.clone();
+
+                        ack_message.peer_acks.push(peer_ack);
+                    });
+
+                    let mut message_wrapper = avalanche::Message::new();
+                    message_wrapper.set_peer_list_ack(ack_message);
+
+                    println!("Sending Peer List Ack message");
+                    _ = self.send_message_queue.send(message_wrapper);
+                }
+
+                // The handshake is completed afer receiving AND sending the PeerList message.
+                _ = self
+                    .status_update_sender
+                    .send(ConnectionStatus::HandshakeCompleted(
+                        SystemTime::now().into(),
+                    ));
             }
             // The Ping message is periodically sent to show that the node is alive and connected
             Some(avalanche::message::Message::Ping(ping_message)) => {
@@ -175,11 +225,27 @@ impl AvalancheClient {
             Some(avalanche::message::Message::Pong(_)) => {
                 println!("Received pong message");
             }
-            // Messages that are not handled yet are printed here
-            x => {
-                println!("Received unknown message: {:?}", x);
+            Some(avalanche::message::Message::CompressedZstd(compressed_bytes)) => {
+                // Decompress the incoming message
+                let decompressed_bytes = decompress(&compressed_bytes, MAX_MESSAGE_LENGTH)
+                    .map_err(|error| {
+                        P2pError::DecompressionError(compressed_bytes, error.to_string())
+                    })?;
+
+                // Deserialize the message
+                let decompressed_message =
+                    avalanche::Message::parse_from_bytes(&decompressed_bytes).map_err(|error| {
+                        P2pError::MessageDeserializationError(decompressed_bytes, error.to_string())
+                    })?;
+
+                // Process the message
+                return self.process_message(decompressed_message);
             }
+            // Messages that are not handled yet are printed here
+            unknown_message => return Err(P2pError::UnknownMessage(Box::new(unknown_message))),
         }
+
+        Ok(())
     }
 
     /// Generates a version message to be sent for handshaking.

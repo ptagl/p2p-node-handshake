@@ -2,7 +2,7 @@ use std::{
     io::{ErrorKind, Read, Write},
     net::TcpStream,
     sync::{mpsc, Arc},
-    time::{Duration, Instant},
+    time::{Duration, SystemTime},
 };
 
 use protobuf::Message;
@@ -23,11 +23,6 @@ type StatusUpdateQueue = mpsc::Sender<ConnectionStatus>;
 pub struct NetworkHandler {
     /// Certificate for the TLS connection
     certificate: Certificate,
-
-    /// A pair storing the instant in which the connection was established
-    /// and the instant in which it was closed. It is useful for
-    /// computing the connection duration.
-    connection_instants: (Option<Instant>, Option<Instant>),
 
     /// Private key for the TLS connection.
     private_key: PrivateKey,
@@ -57,7 +52,6 @@ impl NetworkHandler {
     ) -> Result<Self, P2pError> {
         Ok(Self {
             certificate,
-            connection_instants: (None, None),
             private_key,
             received_messages_queue: received_messages_sender,
             send_messages_queue: send_messages_sender,
@@ -90,8 +84,9 @@ impl NetworkHandler {
         })?;
 
         self.tls_stream = Arc::new(Mutex::new(Some(StreamOwned::new(tls_connection, stream))));
-        self.connection_instants = (Some(Instant::now()), None);
-        _ = self.status_update_queue.send(self.connection_status());
+        _ = self
+            .status_update_queue
+            .send(ConnectionStatus::Connected(SystemTime::now().into()));
 
         Ok(())
     }
@@ -110,8 +105,7 @@ impl NetworkHandler {
             )),
         ];
 
-        // If the execution reaches this point, the TLS connection was closed,
-        // let's wait for the networking async task to stop running.
+        // Wait for the async tasks to stop
         for handle in handles {
             match handle.await {
                 // Return self just in case it is needed for later checks or operations
@@ -121,6 +115,11 @@ impl NetworkHandler {
             }
         }
 
+        _ = self
+            .status_update_queue
+            .send(ConnectionStatus::Closed(SystemTime::now().into()));
+
+        // If the execution reaches this point, the TLS connection was closed.
         Ok(())
     }
 
@@ -293,30 +292,6 @@ impl NetworkHandler {
                 }
             }
         }
-    }
-
-    /// Returns the status of the connection (connected or disconnected).
-    pub fn connection_status(&self) -> ConnectionStatus {
-        match self.connection_instants {
-            // If the end instant has been set, then the connection was terminated
-            (Some(start_instant), Some(end_instant)) => {
-                ConnectionStatus::Closed(end_instant - start_instant)
-            }
-            // If the end instant has not been set yet, the connection is still open
-            (Some(start_instant), None) => {
-                ConnectionStatus::Connected(Instant::now() - start_instant)
-            }
-            (None, _) => ConnectionStatus::NotStarted(),
-        }
-    }
-
-    /// Updates the disconnection instant with the current time.
-    fn set_disconnection_instant(&mut self) {
-        let (_, disconnection_instant) = &mut self.connection_instants;
-        *disconnection_instant = Some(Instant::now());
-
-        // Notify the eventual receiver
-        _ = self.status_update_queue.send(self.connection_status());
     }
 }
 
