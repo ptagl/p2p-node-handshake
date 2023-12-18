@@ -1,5 +1,5 @@
 use std::{
-    io::{ErrorKind, Read},
+    io::{ErrorKind, Read, Write},
     net::TcpStream,
     sync::{mpsc, Arc},
     time::{Duration, Instant},
@@ -17,6 +17,7 @@ use super::{ConnectionStatus, P2pError};
 include!(concat!(env!("OUT_DIR"), "/protos/mod.rs"));
 
 type ReceivedMessageQueue = mpsc::Sender<avalanche::Message>;
+type SendMessageQueue = mpsc::Receiver<avalanche::Message>;
 type StatusUpdateQueue = mpsc::Sender<ConnectionStatus>;
 
 pub struct NetworkHandler {
@@ -34,6 +35,9 @@ pub struct NetworkHandler {
     /// MPSC channel sender to queue messages received from the network.
     received_messages_queue: ReceivedMessageQueue,
 
+    /// MPSC channel receiver to queue messages to be sent to the network.
+    send_messages_queue: SendMessageQueue,
+
     /// MPSC channel sender to periodically report information about
     /// the connection status.
     status_update_queue: StatusUpdateQueue,
@@ -45,18 +49,18 @@ pub struct NetworkHandler {
 impl NetworkHandler {
     /// Creates a new instance of network handler, initializing the MPSC channels for communicating with the layer above.
     pub fn new(
+        private_key: PrivateKey,
+        certificate: Certificate,
         received_messages_sender: ReceivedMessageQueue,
+        send_messages_sender: SendMessageQueue,
         status_update_sender: StatusUpdateQueue,
     ) -> Result<Self, P2pError> {
-        // Generate a private key and a certificate for establishing the TLS connection
-        let (private_key, certificate) = cert_manager::x509::generate_der(None)
-            .map_err(|error| P2pError::CertificateGenerationError(error.to_string()))?;
-
         Ok(Self {
             certificate,
             connection_instants: (None, None),
             private_key,
             received_messages_queue: received_messages_sender,
+            send_messages_queue: send_messages_sender,
             status_update_queue: status_update_sender,
             tls_stream: Arc::new(Mutex::new(None)),
         })
@@ -92,12 +96,43 @@ impl NetworkHandler {
         Ok(())
     }
 
+    /// Async function that runs both read and write threads.
+    pub async fn read_and_write(self) -> Result<(), P2pError> {
+        // Spawn read/write threads
+        let handles = vec![
+            tokio::spawn(NetworkHandler::read_bytes(
+                self.tls_stream.clone(),
+                self.received_messages_queue.clone(),
+            )),
+            tokio::spawn(NetworkHandler::write_bytes(
+                self.tls_stream.clone(),
+                self.send_messages_queue,
+            )),
+        ];
+
+        // If the execution reaches this point, the TLS connection was closed,
+        // let's wait for the networking async task to stop running.
+        for handle in handles {
+            match handle.await {
+                // Return self just in case it is needed for later checks or operations
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => return Err(P2pError::StreamError(error.to_string())), // read error
+                Err(error) => return Err(P2pError::AsyncOperationError(error)), // Future error
+            }
+        }
+
+        Ok(())
+    }
+
     /// Starts reading bytes from the socket until one of the
     /// following things happen:
     /// - an error occurrs
     /// - the connection is closed
     #[allow(clippy::read_zero_byte_vec)] // False positive, see https://github.com/rust-lang/rust-clippy/issues/9274
-    pub async fn read_bytes(mut self) -> Result<Self, P2pError> {
+    async fn read_bytes(
+        stream: Arc<Mutex<Option<StreamOwned<ClientConnection, TcpStream>>>>,
+        received_message_queue: ReceivedMessageQueue,
+    ) -> Result<(), P2pError> {
         /// Macro that simplifies the disconnection of the node (for instance, in case of an unrecoverable error or DoS detection).
         macro_rules! disconnect {
             ($tls_stream:expr) => {
@@ -125,9 +160,6 @@ impl NetworkHandler {
                         Err(error) if error.kind() == ErrorKind::WouldBlock => continue $label,
                         Err(error) => {
                             println!("Unexpected stream error: {:?}", error);
-
-                            // Notify the disconnection and stop the async task
-                            self.set_disconnection_instant();
                             return Err(P2pError::StreamError(error.to_string()));
                         }
                     }
@@ -136,8 +168,6 @@ impl NetworkHandler {
                 }
             }
         }
-
-        let stream = self.tls_stream.clone();
 
         // Use this buffer to read the header of any P2P message.
         // The protocol uses 4 bytes to store the size of the following message.
@@ -212,9 +242,55 @@ impl NetworkHandler {
 
             // If queuing the message fails, it means that the top layer stopped listening,
             // so we can stop reading from the socket.
-            if self.received_messages_queue.send(message).is_err() {
+            if received_message_queue.send(message).is_err() {
                 disconnect!(stream);
-                return Ok(self);
+                return Ok(());
+            }
+        }
+    }
+
+    /// Deserializes P2P messages and sent them to the destination peer.
+    async fn write_bytes(
+        stream: Arc<Mutex<Option<StreamOwned<ClientConnection, TcpStream>>>>,
+        send_message_queue: SendMessageQueue,
+    ) -> Result<(), P2pError> {
+        loop {
+            // recv() is blocking and seems fine here as the function should do nothing if there are no messages to send.
+            let message = match send_message_queue.recv() {
+                Ok(message) => message,
+                Err(_) => return Ok(()), // The channel has been closed, stop the thread
+            };
+
+            // Attempt of serializing the message
+            let payload_bytes = match message.write_to_bytes() {
+                Ok(payload) => payload,
+                Err(error) => {
+                    println!(
+                        r#"An error occurred while serializing the message, it will be skipped.
+                                Error: {}\n
+                                {}\n"#,
+                        error, message
+                    );
+
+                    // A serialization error here would be odd and probably just the tip of the iceberg, but be optimistic and just skip.
+                    continue;
+                }
+            };
+
+            let header_bytes = (payload_bytes.len() as u32).to_be_bytes();
+            let message_bytes = [header_bytes.to_vec(), payload_bytes].concat();
+
+            // Lock the stream and write the message.
+            if let Some(stream) = stream.lock().await.as_mut() {
+                match stream.write_all(message_bytes.as_slice()) {
+                    Ok(_) => {}
+                    Err(error) => {
+                        println!("Write error: {}", error);
+
+                        // A stream error is typically not recoverable (e.g. broken pipe, disconnection, etc.), so we can stop the loop.
+                        return Ok(());
+                    }
+                }
             }
         }
     }
