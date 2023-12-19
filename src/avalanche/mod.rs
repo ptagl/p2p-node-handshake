@@ -5,8 +5,6 @@ mod tls;
 
 pub use p2p::AvalancheClient;
 
-use self::network::avalanche;
-
 use chrono::{DateTime, Utc};
 use std::fmt::Display;
 use tokio::task::JoinError;
@@ -17,6 +15,9 @@ const MESSAGE_HEADER_LENGTH: usize = 4;
 /// This constant is to prevent DoS attacks from malicious nodes.
 /// For instance, we don't want to parse a message whose size is 10 GB and make the application crash.
 const MAX_MESSAGE_LENGTH: usize = 1024 * 1024 * 4; // 4 MB
+
+// Include the protobuf generated code for the Avalanche P2P messages
+include!(concat!(env!("OUT_DIR"), "/protos/mod.rs"));
 
 /// P2P errors handled by the network layer.
 #[derive(Debug)]

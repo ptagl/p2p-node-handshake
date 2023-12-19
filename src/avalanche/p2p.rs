@@ -11,8 +11,7 @@ use x509_certificate::Signer;
 use zstd::bulk::decompress;
 
 use super::{
-    network::{avalanche, NetworkHandler},
-    ConnectionStatus, MessageType, P2pError, MAX_MESSAGE_LENGTH,
+    avalanche, network::NetworkHandler, ConnectionStatus, MessageType, P2pError, MAX_MESSAGE_LENGTH,
 };
 
 type ReceivedMessageQueue = mpsc::Receiver<avalanche::Message>;
@@ -385,7 +384,7 @@ mod tests {
     };
 
     use crate::avalanche::{
-        network::avalanche::{self, Message},
+        avalanche::{self, Message},
         ConnectionStatus, MessageType, P2pError,
     };
 

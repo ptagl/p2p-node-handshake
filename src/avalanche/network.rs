@@ -11,10 +11,7 @@ use tokio::sync::Mutex;
 
 use crate::avalanche::{MAX_MESSAGE_LENGTH, MESSAGE_HEADER_LENGTH};
 
-use super::{tls, ConnectionStatus, P2pError};
-
-// Include the protobuf generated code for the Avalanche P2P messages
-include!(concat!(env!("OUT_DIR"), "/protos/mod.rs"));
+use super::{avalanche, tls, ConnectionStatus, P2pError};
 
 type ReceivedMessageQueue = mpsc::Sender<avalanche::Message>;
 type SendMessageQueue = mpsc::Receiver<avalanche::Message>;
@@ -310,8 +307,7 @@ impl NetworkHandler {
 
 #[cfg(test)]
 mod tests {
-    /// Tests for [`NetworkHandler`] ......................................
-
+    /// Tests for [`NetworkHandler`] connect() function.
     mod connect {
         use crate::avalanche::{
             network::{avalanche::Message, NetworkHandler},
