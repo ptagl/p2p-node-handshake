@@ -18,14 +18,14 @@ async fn main() {
     match client.connect() {
         Ok(_) => {}
         Err(error) => {
-            println!("An error occurred while connecting to peer: {}", error);
+            println!("An error occurred while connecting to the peer: {}", error);
             return;
         }
     };
 
     // Run the client async task and wait for its completion
     match tokio::spawn(client.run()).await {
-        Ok(Ok(_)) => println!("Client run succesfully!"),
+        Ok(Ok(_)) => println!("Client run successfully!"),
         Ok(Err(error)) => println!(
             "An error occurred while running the P2P client: {:?}",
             error

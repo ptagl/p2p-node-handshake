@@ -44,6 +44,9 @@ pub enum P2pError {
     TlsConfigurationError(String, String),
     /// The received message is not recognized.
     UnknownMessage(Box<Option<avalanche::message::Message>>),
+    /// An unexpected message was received compared to the order specified by the protocol.
+    /// The first type is the expected message, the second is the current one.
+    WrongMessageOrder(MessageType, MessageType),
 }
 
 impl Display for P2pError {
@@ -111,6 +114,11 @@ impl Display for P2pError {
                 ip_address, error_message
             ),
             Self::UnknownMessage(message) => write!(f, "Unknown message received: {:?}", message),
+            Self::WrongMessageOrder(expected, received) => write!(
+                f,
+                "Wrong message order, expected {:?}, found {:?}",
+                expected, received
+            ),
         }
     }
 }
@@ -122,7 +130,7 @@ pub enum ConnectionStatus {
     Connected(DateTime<Utc>),
     /// The node is performing the handshaking with the remote peer.
     HandshakeStarted(DateTime<Utc>),
-    /// The handshaking phase was completed succesfully.
+    /// The handshaking phase was completed successfully.
     HandshakeCompleted(DateTime<Utc>),
     /// The connection was closed.
     Closed(DateTime<Utc>),
@@ -149,4 +157,20 @@ impl Display for ConnectionStatus {
             Self::Closed(event_time) => write!(f, "[{}] Connection closed", event_time),
         }
     }
+}
+
+/// This enum is used to enforce some basic rules in messages processing,
+/// like that any P2P communication must start with a Version message,
+/// immediately followed by a PeerList message.
+/// This sequence completes the handshake phase.
+/// Any other message could be only received after this phase.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum MessageType {
+    /// The Version message is the first sent in the P2P sequence.
+    Version,
+    /// The PeerList message is the second in the sequence, it follows the Version one.
+    PeerList,
+    /// Any message type, it could be sent after having received a PeerList message,
+    /// indicating the successful completion of the handshake procedure.
+    Any,
 }

@@ -157,10 +157,7 @@ impl NetworkHandler {
                         Ok(_) => {},
                         // WouldBlock is returned by non-blocking streams when there is no data to read yet
                         Err(error) if error.kind() == ErrorKind::WouldBlock => continue $label,
-                        Err(error) => {
-                            println!("Unexpected stream error: {:?}", error);
-                            return Err(P2pError::StreamError(error.to_string()));
-                        }
+                        Err(error) => return Err(P2pError::StreamError(error.to_string()))
                     }
                 } else {
                     panic!("Unexpected error: stream Option was None!!!");

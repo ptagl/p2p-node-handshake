@@ -12,7 +12,7 @@ use zstd::bulk::decompress;
 
 use super::{
     network::{avalanche, NetworkHandler},
-    ConnectionStatus, P2pError, MAX_MESSAGE_LENGTH,
+    ConnectionStatus, MessageType, P2pError, MAX_MESSAGE_LENGTH,
 };
 
 type ReceivedMessageQueue = mpsc::Receiver<avalanche::Message>;
@@ -28,6 +28,10 @@ pub struct AvalancheClient {
     /// Handler for the management of the network layer.
     /// It is an Option as it must be moved when running asynchronously.
     network_handler: Option<NetworkHandler>,
+
+    /// Message type that is expected to be received next. This field is
+    /// used to detect misbehaving nodes (e.g. sending messages in the wrong order).
+    next_expected_message: MessageType,
 
     /// The private key is used to establish the TLS connection, but also for
     /// signing some fields of P2P messages.
@@ -75,6 +79,7 @@ impl AvalancheClient {
         Ok(Self {
             destination_address: destination_address.to_string(),
             network_handler: Some(network_handler),
+            next_expected_message: MessageType::Version,
             private_key,
             received_message_queue: received_message_receiver,
             send_message_queue: send_messages_sender,
@@ -116,6 +121,16 @@ impl AvalancheClient {
 
             match process_result {
                 Ok(_) => {}
+                Err(P2pError::WrongMessageOrder(expected_type, current_type)) => {
+                    println!(
+                        "Received a message in the wrong order, expected [{:?}], found [{:?}]",
+                        expected_type, current_type
+                    );
+
+                    // This behavior is considered malicious, let's disconnect the peer.
+                    // This mechanism could be improved with the implementation of a ban score system
+                    // (e.g. ban after N wrong messages).
+                }
                 Err(error) => println!("Process message error: {}", error),
             }
 
@@ -147,7 +162,10 @@ impl AvalancheClient {
     }
 
     /// Handles an incoming P2P message read from the network
-    fn process_message(&self, message_wrapper: avalanche::Message) -> Result<(), P2pError> {
+    fn process_message(&mut self, message_wrapper: avalanche::Message) -> Result<(), P2pError> {
+        // Check message ordering to detect potential misbheaving nodes
+        self.check_message_order(&message_wrapper.message)?;
+
         match message_wrapper.message {
             // Version is the first message sent by P2P nodes when performing the handshaking
             Some(avalanche::message::Message::Version(version_message)) => {
@@ -174,6 +192,9 @@ impl AvalancheClient {
                 let mut message_wrapper = avalanche::Message::new();
                 message_wrapper.set_peer_list(avalanche::PeerList::new());
                 _ = self.send_message_queue.send(message_wrapper);
+
+                // Next message must be a PeerList to complete the handshaking
+                self.next_expected_message = MessageType::PeerList;
             }
             // Message containing the peers known by the remote node
             Some(avalanche::message::Message::PeerList(peer_list)) => {
@@ -202,11 +223,16 @@ impl AvalancheClient {
                 }
 
                 // The handshake is completed afer receiving AND sending the PeerList message.
+                // The message from our side has been already sent together with the Version one,
+                // otherwise we wouldn't accept the incoming PeerList (see self.check_message_order()).
                 _ = self
                     .status_update_sender
                     .send(ConnectionStatus::HandshakeCompleted(
                         SystemTime::now().into(),
                     ));
+
+                // Next message could be anything
+                self.next_expected_message = MessageType::Any;
             }
             // The Ping message is periodically sent to show that the node is alive and connected
             Some(avalanche::message::Message::Ping(ping_message)) => {
@@ -243,6 +269,52 @@ impl AvalancheClient {
             }
             // Messages that are not handled yet are printed here
             unknown_message => return Err(P2pError::UnknownMessage(Box::new(unknown_message))),
+        }
+
+        Ok(())
+    }
+
+    /// Checks whether a message arrives in the right order or not.
+    /// For instance, a PeerList message must always arrive after a Version one.
+    fn check_message_order(
+        &self,
+        message: &Option<avalanche::message::Message>,
+    ) -> Result<(), P2pError> {
+        let expected_message = self.next_expected_message;
+
+        match message {
+            // Version is always the first message to be sent to start the handshake
+            Some(avalanche::message::Message::Version(_)) => {
+                if expected_message != MessageType::Version {
+                    return Err(P2pError::WrongMessageOrder(
+                        expected_message,
+                        MessageType::Version,
+                    ));
+                }
+            }
+            // The PeerList message is typically sent as second message of the communication,
+            // immediately after Version, but it could arrive also later in case of updates
+            Some(avalanche::message::Message::PeerList(_)) => {
+                if expected_message != MessageType::PeerList && expected_message != MessageType::Any
+                {
+                    return Err(P2pError::WrongMessageOrder(
+                        expected_message,
+                        MessageType::PeerList,
+                    ));
+                }
+            }
+            // Ignore compressed messages as we don't know the type until we decompress
+            Some(avalanche::message::Message::CompressedGzip(_)) => {}
+            Some(avalanche::message::Message::CompressedZstd(_)) => {}
+            // Any other message can be sent only after the handshake is completed
+            _ => {
+                if expected_message != MessageType::Any {
+                    return Err(P2pError::WrongMessageOrder(
+                        expected_message,
+                        MessageType::Any,
+                    ));
+                }
+            }
         }
 
         Ok(())
