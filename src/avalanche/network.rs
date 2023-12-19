@@ -11,7 +11,7 @@ use tokio::sync::Mutex;
 
 use crate::avalanche::{MAX_MESSAGE_LENGTH, MESSAGE_HEADER_LENGTH};
 
-use super::{ConnectionStatus, P2pError};
+use super::{tls, ConnectionStatus, P2pError};
 
 // Include the protobuf generated code for the Avalanche P2P messages
 include!(concat!(env!("OUT_DIR"), "/protos/mod.rs"));
@@ -288,70 +288,6 @@ impl NetworkHandler {
                     }
                 }
             }
-        }
-    }
-}
-
-/// Module containing helper functions to setup TLS connections.
-mod tls {
-    use std::{sync::Arc, time::SystemTime};
-
-    use rustls::{
-        client::ServerCertVerifier, Certificate, ClientConfig, ClientConnection, PrivateKey,
-        ServerName,
-    };
-
-    use crate::avalanche::P2pError;
-
-    /// Initializes a TLS connection configuration to connect to Avalanche nodes.
-    pub fn get_tls_connection(
-        ip_address: &str,
-        private_key: PrivateKey,
-        certificate: Certificate,
-    ) -> Result<ClientConnection, P2pError> {
-        let server_name = ServerName::try_from(ip_address)
-            .map_err(|error| P2pError::InvalidServerName(error.to_string()))?;
-
-        // Prepare a basic configuration
-        let config = Arc::new(
-            get_default_tls_config((private_key.clone(), certificate.clone())).map_err(
-                |error| P2pError::TlsConfigurationError(ip_address.to_string(), error.to_string()),
-            )?,
-        );
-
-        Ok(ClientConnection::new(config, server_name).map_err(|error| {
-            P2pError::TlsConfigurationError(ip_address.to_string(), error.to_string())
-        }))?
-    }
-
-    /// Returns a basic configuration to establish a TLS connection.
-    /// This shouldn't be used in production as, for instance,
-    /// the certificate verification is disable (see [`NoCertificateVerification`]).
-    fn get_default_tls_config(
-        (private_key, certificate): (PrivateKey, Certificate),
-    ) -> Result<ClientConfig, String> {
-        rustls::ClientConfig::builder()
-            .with_safe_defaults()
-            .with_custom_certificate_verifier(Arc::new(NoCertificateVerification {}))
-            .with_client_auth_cert(vec![certificate], private_key)
-            .map_err(|error| error.to_string())
-    }
-
-    /// Mock struct to disable the verification of TLS certificates.
-    /// This is needed as Avalanche nodes may have self-signed certificates.
-    struct NoCertificateVerification {}
-
-    impl ServerCertVerifier for NoCertificateVerification {
-        fn verify_server_cert(
-            &self,
-            _end_entity: &Certificate,
-            _intermediates: &[Certificate],
-            _server_name: &ServerName,
-            _scts: &mut dyn Iterator<Item = &[u8]>,
-            _ocsp_response: &[u8],
-            _now: SystemTime,
-        ) -> std::result::Result<rustls::client::ServerCertVerified, rustls::Error> {
-            Ok(rustls::client::ServerCertVerified::assertion())
         }
     }
 }

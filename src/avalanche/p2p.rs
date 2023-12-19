@@ -353,3 +353,6 @@ impl AvalancheClient {
         version_message
     }
 }
+
+#[cfg(test)]
+mod tests {}

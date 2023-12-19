@@ -1,14 +1,15 @@
 pub mod network;
 
 mod p2p;
-use chrono::{DateTime, Utc};
+mod tls;
+
 pub use p2p::AvalancheClient;
 
-use std::fmt::Display;
-
-use tokio::task::JoinError;
-
 use self::network::avalanche;
+
+use chrono::{DateTime, Utc};
+use std::fmt::Display;
+use tokio::task::JoinError;
 
 /// Size in bytes of the P2P message header.
 const MESSAGE_HEADER_LENGTH: usize = 4;
@@ -33,7 +34,7 @@ pub enum P2pError {
     /// The P2P message size exceeds the max limit allowed.
     InvalidMessageSize(usize, usize),
     /// Unable to convert the IP address into a server name for the TLS connection.
-    InvalidServerName(String),
+    InvalidServerName(String, String),
     /// Unable to deserialize the message.
     MessageDeserializationError(Vec<u8>, String),
     /// Error while configuring the socket stream.
@@ -87,8 +88,12 @@ impl Display for P2pError {
                 "Message size ({} bytes) exceeded max allowed ({} bytes)",
                 message_size, max_message_size
             ),
-            Self::InvalidServerName(server_name) => {
-                write!(f, "Unable to parse server name, input is: {}", server_name)
+            Self::InvalidServerName(server_name, error_message) => {
+                write!(
+                    f,
+                    "Unable to parse server name, input is {}, error: {}",
+                    server_name, error_message
+                )
             }
             Self::MessageDeserializationError(bytes, error_message) => {
                 write!(
@@ -119,6 +124,44 @@ impl Display for P2pError {
                 "Wrong message order, expected {:?}, found {:?}",
                 expected, received
             ),
+        }
+    }
+}
+
+impl PartialEq for P2pError {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::AsyncOperationError(l0), Self::AsyncOperationError(r0)) => {
+                l0.to_string() == r0.to_string()
+            }
+            (Self::CertificateGenerationError(l0), Self::CertificateGenerationError(r0)) => {
+                l0 == r0
+            }
+            (Self::ConnectionError(l0, l1), Self::ConnectionError(r0, r1)) => l0 == r0 && l1 == r1,
+            (Self::DecompressionError(l0, l1), Self::DecompressionError(r0, r1)) => {
+                l0 == r0 && l1 == r1
+            }
+            (Self::InvalidAddress(l0), Self::InvalidAddress(r0)) => l0 == r0,
+            (Self::InvalidMessageSize(l0, l1), Self::InvalidMessageSize(r0, r1)) => {
+                l0 == r0 && l1 == r1
+            }
+            (Self::InvalidServerName(l0, l1), Self::InvalidServerName(r0, r1)) => {
+                l0 == r0 && l1 == r1
+            }
+            (
+                Self::MessageDeserializationError(l0, l1),
+                Self::MessageDeserializationError(r0, r1),
+            ) => l0 == r0 && l1 == r1,
+            (Self::StreamConfigurationError(l0), Self::StreamConfigurationError(r0)) => l0 == r0,
+            (Self::StreamError(l0), Self::StreamError(r0)) => l0 == r0,
+            (Self::TlsConfigurationError(l0, l1), Self::TlsConfigurationError(r0, r1)) => {
+                l0 == r0 && l1 == r1
+            }
+            (Self::UnknownMessage(l0), Self::UnknownMessage(r0)) => l0 == r0,
+            (Self::WrongMessageOrder(l0, l1), Self::WrongMessageOrder(r0, r1)) => {
+                l0 == r0 && l1 == r1
+            }
+            _ => false,
         }
     }
 }
