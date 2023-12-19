@@ -24,7 +24,7 @@ async fn main() {
     };
 
     // Run the client async task and wait for its completion
-    match tokio::spawn(client.run()).await {
+    match tokio::spawn(client.run_all()).await {
         Ok(Ok(_)) => println!("Client run successfully!"),
         Ok(Err(error)) => println!(
             "An error occurred while running the P2P client: {:?}",

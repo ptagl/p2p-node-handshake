@@ -61,7 +61,7 @@ impl ServerCertVerifier for NoCertificateVerification {
 
 #[cfg(test)]
 mod tests {
-    /// The [`get_tls_connection`] function expects a valid IP address as input, without the port.
+    /// Tests for the [`get_tls_connection`] function expects a valid IP address as input, without the port.
     mod tls_connection {
         use crate::avalanche::{tls::get_tls_connection, P2pError};
 

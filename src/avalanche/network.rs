@@ -20,6 +20,7 @@ type ReceivedMessageQueue = mpsc::Sender<avalanche::Message>;
 type SendMessageQueue = mpsc::Receiver<avalanche::Message>;
 type StatusUpdateQueue = mpsc::Sender<ConnectionStatus>;
 
+#[derive(Debug)]
 pub struct NetworkHandler {
     /// Certificate for the TLS connection
     certificate: Certificate,
@@ -49,15 +50,15 @@ impl NetworkHandler {
         received_messages_sender: ReceivedMessageQueue,
         send_messages_sender: SendMessageQueue,
         status_update_sender: StatusUpdateQueue,
-    ) -> Result<Self, P2pError> {
-        Ok(Self {
+    ) -> Self {
+        Self {
             certificate,
             private_key,
             received_messages_queue: received_messages_sender,
             send_messages_queue: send_messages_sender,
             status_update_queue: status_update_sender,
             tls_stream: Arc::new(Mutex::new(None)),
-        })
+        }
     }
 
     /// Starts a connection to the destination_address and returns a [`NetworkHandler`]
@@ -93,6 +94,21 @@ impl NetworkHandler {
 
     /// Async function that runs both read and write threads.
     pub async fn read_and_write(self) -> Result<(), P2pError> {
+        // Let's use this case (missing tls_stream Option)
+        // to run the handler as a mock for unit tests.
+        // This is not the most elegant way, but one of the easiest ones.
+        // The best alternative to me would be to define a Trait and have
+        // a real implementation for the standard application and a mocked
+        // one for tests, but read_and_write() is async, and Rust currently
+        // doesn't support async in traits, I would need another crate,
+        // or use the nightly build, but let's keep it simple for now.
+        #[cfg(test)]
+        {
+            if self.tls_stream.lock().await.is_none() {
+                return Ok(());
+            }
+        }
+
         // Spawn read/write threads
         let handles = vec![
             tokio::spawn(NetworkHandler::read_bytes(
@@ -288,6 +304,85 @@ impl NetworkHandler {
                     }
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Tests for [`NetworkHandler`] ......................................
+
+    mod connect {
+        use crate::avalanche::{
+            network::{avalanche::Message, NetworkHandler},
+            ConnectionStatus, P2pError,
+        };
+
+        use std::sync::mpsc::channel;
+
+        /// Generates a default NetworkHandler for testing purpose
+        fn default_network_handler() -> NetworkHandler {
+            let (private_key, certificate) = cert_manager::x509::generate_der(None).unwrap();
+            let (received_messages_sender, _) = channel::<Message>();
+
+            // Send messages channel
+            let (_, send_messages_receiver) = channel::<Message>();
+
+            // Status update channel
+            let (status_sender, _) = channel::<ConnectionStatus>();
+
+            // Create an object that will handle the network communication
+            NetworkHandler::new(
+                private_key.clone(),
+                certificate,
+                received_messages_sender,
+                send_messages_receiver,
+                status_sender.clone(),
+            )
+        }
+
+        #[test]
+        fn ip_address_without_port() {
+            let mut network_handler = default_network_handler();
+            // The network handler requires the IP port specified
+            let ip_address = String::from("127.0.0.1");
+
+            let connection_result = network_handler.connect(&ip_address);
+            assert_eq!(
+                connection_result.unwrap_err(),
+                P2pError::InvalidAddress(ip_address)
+            );
+        }
+
+        #[test]
+        fn invalid_ip_port() {
+            let mut network_handler = default_network_handler();
+            // 65535 is the last valid port
+            let ip_address = String::from("127.0.0.1:65536");
+
+            let connection_result = network_handler.connect(&ip_address);
+
+            assert_eq!(
+                connection_result.unwrap_err(),
+                P2pError::ConnectionError(ip_address, String::from("invalid port value"))
+            );
+        }
+
+        #[test]
+        fn server_not_available() {
+            let mut network_handler = default_network_handler();
+            // IMPORTANT: we assume that no application is listening on 65535
+            let ip_address = String::from("127.0.0.1:65535");
+
+            let connection_result = network_handler.connect(&ip_address);
+
+            assert_eq!(
+                connection_result.unwrap_err(),
+                P2pError::ConnectionError(
+                    ip_address,
+                    String::from("Connection refused (os error 111)")
+                )
+            );
         }
     }
 }

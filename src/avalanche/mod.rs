@@ -167,6 +167,7 @@ impl PartialEq for P2pError {
 }
 
 /// It represents all the possible statuses for a P2P connection.
+#[derive(Debug)]
 pub enum ConnectionStatus {
     /// The connection has been established and is currently open,
     /// but the handshake has not been completed yet.
