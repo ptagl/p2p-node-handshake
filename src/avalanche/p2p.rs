@@ -11,8 +11,7 @@ use x509_certificate::Signer;
 use zstd::bulk::decompress;
 
 use super::{
-    avalanche, network::NetworkHandler, ConnectionStatus, MessageType, P2pError,
-    INACTIVITY_TIMEOUT, MAX_MESSAGE_LENGTH,
+    avalanche, network::NetworkHandler, ConnectionStatus, MessageType, P2pError, MAX_MESSAGE_LENGTH,
 };
 
 type ReceivedMessageQueue = mpsc::Receiver<avalanche::Message>;
@@ -25,6 +24,10 @@ type StatusUpdateSender = mpsc::Sender<ConnectionStatus>;
 pub struct AvalancheClient {
     /// Address of the remote peer.
     destination_address: String,
+
+    /// Inactivity timeout for connected peers. Peers are required to send
+    /// at least one message within the timeout period to not be disconnected.
+    inactivity_timeout: Duration,
 
     /// Timestamp of the last message received. This is used to implement a
     /// protection mechanism and disconnect peers after an inactivity timeout.
@@ -59,7 +62,7 @@ pub struct AvalancheClient {
 
 impl AvalancheClient {
     /// Creates a new client instance to later connect to the destination address provided.
-    pub fn new(destination_address: &str) -> Result<Self, P2pError> {
+    pub fn new(destination_address: &str, inactivity_timeout: u64) -> Result<Self, P2pError> {
         // Generate a private key and a certificate for establishing the TLS connection
         let (private_key, certificate) = cert_manager::x509::generate_der(None)
             .map_err(|error| P2pError::CertificateGenerationError(error.to_string()))?;
@@ -85,6 +88,7 @@ impl AvalancheClient {
 
         Ok(Self {
             destination_address: destination_address.to_string(),
+            inactivity_timeout: Duration::from_secs(inactivity_timeout),
             last_message_timestamp: SystemTime::now(),
             network_handler: Some(network_handler),
             next_expected_message: MessageType::Version,
@@ -316,8 +320,8 @@ impl AvalancheClient {
     /// In case of inactivity, an error is returned so that the connection can be closed.
     fn check_inactivity(&self) -> Result<(), P2pError> {
         match self.last_message_timestamp.elapsed() {
-            Ok(time) if time < INACTIVITY_TIMEOUT => Ok(()),
-            Ok(_) => Err(P2pError::InactivePeer(INACTIVITY_TIMEOUT)),
+            Ok(time) if time < self.inactivity_timeout => Ok(()),
+            Ok(_) => Err(P2pError::InactivePeer(self.inactivity_timeout)),
             Err(error) => panic!(
                 "Fatal error, the last received message comes from the future! {}",
                 error
@@ -433,7 +437,7 @@ mod tests {
 
     use crate::avalanche::{
         avalanche::{self, Message},
-        ConnectionStatus, MessageType, P2pError,
+        ConnectionStatus, MessageType, P2pError, DEFAULT_INACTIVITY_TIMEOUT, DEFAULT_IP_ADDRESS,
     };
 
     use super::AvalancheClient;
@@ -450,7 +454,8 @@ mod tests {
 
     /// Creates a default client for tests.
     fn default_client() -> (AvalancheClient, ClientTestChannels) {
-        let mut client = AvalancheClient::new("127.0.0.1:80").unwrap();
+        let mut client =
+            AvalancheClient::new(DEFAULT_IP_ADDRESS, DEFAULT_INACTIVITY_TIMEOUT).unwrap();
 
         // Creates channels to be used by tests. We use the same side used
         // by the network handler to trigger client actions (e.g. simulate

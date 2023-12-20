@@ -1,16 +1,28 @@
-use std::env;
+use avalanche::{DEFAULT_INACTIVITY_TIMEOUT, DEFAULT_IP_ADDRESS};
+use clap::Parser;
 
 mod avalanche;
 
+/// Struct containing the command line arguments supported.
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// IP address of the destination peer as [ADDRESS]:[PORT]
+    #[arg(short, long, default_value_t = String::from(DEFAULT_IP_ADDRESS))]
+    ip_address: String,
+
+    /// Inactivity timeout for P2P communications (seconds)
+    #[arg(short, long, default_value_t = DEFAULT_INACTIVITY_TIMEOUT)]
+    timeout: u64,
+}
+
 #[tokio::main]
 async fn main() {
-    let ip_address = match get_command_line_arguments() {
-        Ok(address) => address,
-        Err(_) => return,
-    };
+    // Parse the command line arguments
+    let args = Args::parse();
 
     // Create a client instance to connect to the peer
-    let mut client = match avalanche::AvalancheClient::new(&ip_address) {
+    let mut client = match avalanche::AvalancheClient::new(&args.ip_address, args.timeout) {
         Ok(client) => client,
         Err(error) => {
             println!(
@@ -42,25 +54,4 @@ async fn main() {
             error
         ),
     }
-}
-
-/// Parses the command line arguments.
-fn get_command_line_arguments() -> Result<String, ()> {
-    let mut args: Vec<String> = env::args().collect();
-
-    let destination_address = match args.len() {
-        // If no argument is passed, use the default destination
-        1 => String::from("127.0.0.1:9651"),
-        2 => args.pop().unwrap(),
-        _ => {
-            println!(
-                r#"Too many arguments, expected 1.
-                   Usage: p2p-node-handshake [port]:[ip]
-                   Example: p2p-node-handshake 127.0.0.1:9651"#
-            );
-            return Err(());
-        }
-    };
-
-    Ok(destination_address)
 }

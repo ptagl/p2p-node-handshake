@@ -9,9 +9,11 @@ use chrono::{DateTime, Utc};
 use std::{fmt::Display, time::Duration};
 use tokio::task::JoinError;
 
-/// Inactivity timeout for connected peers. Peers are required to send
-/// at least one message within the timeout period to not be disconnected.
-const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(60);
+/// Default inactivity timeout after which remote peers get disconnected (seconds).
+pub const DEFAULT_INACTIVITY_TIMEOUT: u64 = 60;
+
+/// Default IP address used to connect to a peer in case no argument is provided.
+pub const DEFAULT_IP_ADDRESS: &str = "127.0.0.1:9651";
 
 /// Size in bytes of the P2P message header.
 const MESSAGE_HEADER_LENGTH: usize = 4;
