@@ -6,8 +6,12 @@ mod tls;
 pub use p2p::AvalancheClient;
 
 use chrono::{DateTime, Utc};
-use std::fmt::Display;
+use std::{fmt::Display, time::Duration};
 use tokio::task::JoinError;
+
+/// Inactivity timeout for connected peers. Peers are required to send
+/// at least one message within the timeout period to not be disconnected.
+const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Size in bytes of the P2P message header.
 const MESSAGE_HEADER_LENGTH: usize = 4;
@@ -30,6 +34,8 @@ pub enum P2pError {
     ConnectionError(String, String),
     /// Unable to decompress an incoming message
     DecompressionError(Vec<u8>, String),
+    /// The remote peer didn't send any message for longer than [`INACTIVITY_TIMEOUT`].
+    InactivePeer(Duration),
     /// Unable to convert the string into a valid [IP]:[PORT] pair.
     InvalidAddress(String),
     /// The P2P message size exceeds the max limit allowed.
@@ -78,6 +84,11 @@ impl Display for P2pError {
 
                 "#,
                 error_message, compressed_bytes
+            ),
+            Self::InactivePeer(duration) => write!(
+                f,
+                "Peer was inactive for more than {} seconds",
+                duration.as_secs()
             ),
             Self::InvalidAddress(destination_address) => write!(
                 f,
@@ -142,6 +153,7 @@ impl PartialEq for P2pError {
             (Self::DecompressionError(l0, l1), Self::DecompressionError(r0, r1)) => {
                 l0 == r0 && l1 == r1
             }
+            (Self::InactivePeer(l0), Self::InactivePeer(r0)) => l0 == r0,
             (Self::InvalidAddress(l0), Self::InvalidAddress(r0)) => l0 == r0,
             (Self::InvalidMessageSize(l0, l1), Self::InvalidMessageSize(r0, r1)) => {
                 l0 == r0 && l1 == r1

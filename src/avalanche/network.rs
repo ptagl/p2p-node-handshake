@@ -263,11 +263,18 @@ impl NetworkHandler {
         stream: Arc<Mutex<Option<StreamOwned<ClientConnection, TcpStream>>>>,
         send_message_queue: SendMessageQueue,
     ) -> Result<(), P2pError> {
+        // In case we receive a shutdown request from the top layer, let's use this flag to
+        // trigger the disconnection of the peer (otherwise the read_bytes task would be stuck).
+        let shutdown_requested;
+
         loop {
             // recv() is blocking and seems fine here as the function should do nothing if there are no messages to send.
             let message = match send_message_queue.recv() {
                 Ok(message) => message,
-                Err(_) => return Ok(()), // The channel has been closed, stop the thread
+                Err(_) => {
+                    shutdown_requested = true;
+                    break;
+                }
             };
 
             // Attempt of serializing the message
@@ -302,6 +309,18 @@ impl NetworkHandler {
                 }
             }
         }
+
+        if shutdown_requested {
+            _ = stream
+                .lock()
+                .await
+                .as_mut()
+                .unwrap()
+                .sock
+                .shutdown(std::net::Shutdown::Both);
+        }
+
+        Ok(())
     }
 }
 

@@ -11,7 +11,8 @@ use x509_certificate::Signer;
 use zstd::bulk::decompress;
 
 use super::{
-    avalanche, network::NetworkHandler, ConnectionStatus, MessageType, P2pError, MAX_MESSAGE_LENGTH,
+    avalanche, network::NetworkHandler, ConnectionStatus, MessageType, P2pError,
+    INACTIVITY_TIMEOUT, MAX_MESSAGE_LENGTH,
 };
 
 type ReceivedMessageQueue = mpsc::Receiver<avalanche::Message>;
@@ -24,6 +25,10 @@ type StatusUpdateSender = mpsc::Sender<ConnectionStatus>;
 pub struct AvalancheClient {
     /// Address of the remote peer.
     destination_address: String,
+
+    /// Timestamp of the last message received. This is used to implement a
+    /// protection mechanism and disconnect peers after an inactivity timeout.
+    last_message_timestamp: SystemTime,
 
     /// Handler for the management of the network layer.
     /// It is an Option as it must be moved when running asynchronously.
@@ -41,7 +46,9 @@ pub struct AvalancheClient {
     received_message_queue: ReceivedMessageQueue,
 
     /// The queue of messages that are ready to be serialized and sent through the network.
-    send_message_queue: SendMessageQueue,
+    /// It is optional so that we can discard it to notify the lower level (socket) to
+    /// close the connection.
+    send_message_queue: Option<SendMessageQueue>,
 
     /// The queue of status updates from the network layer (receiver).
     status_update_receiver: StatusUpdateReceiver,
@@ -78,11 +85,12 @@ impl AvalancheClient {
 
         Ok(Self {
             destination_address: destination_address.to_string(),
+            last_message_timestamp: SystemTime::now(),
             network_handler: Some(network_handler),
             next_expected_message: MessageType::Version,
             private_key,
             received_message_queue: received_message_receiver,
-            send_message_queue: send_messages_sender,
+            send_message_queue: Some(send_messages_sender),
             status_update_receiver: status_receiver,
             status_update_sender: status_sender,
         })
@@ -96,6 +104,8 @@ impl AvalancheClient {
             panic!("Unexpected error: network_handler was None!");
         }
 
+        self.last_message_timestamp = SystemTime::now();
+
         Ok(())
     }
 
@@ -105,6 +115,10 @@ impl AvalancheClient {
         // Monitor status updates from the network handler
         loop {
             tokio::time::sleep(Duration::from_millis(100)).await;
+
+            // Check if the connection is stalling (remote peer
+            // not sending any message for too long).
+            self.check_inactivity()?;
 
             // Check if there is any incoming message to be processed
             match self.received_message_queue.try_recv() {
@@ -153,6 +167,12 @@ impl AvalancheClient {
             Err(error) => println!("Process message error: {}", error),
         }
 
+        // Close the channels with the NetworkHandler to make it close the connection and stop.
+        // This is useful when the run_client() function returns an error that does not depend
+        // on the network layer (for instance in case of inactivity timeout), otherwise the
+        // NetworkHandler would stop on its own.
+        drop(self.send_message_queue.take());
+
         // If the execution reaches this point, the TLS connection was closed,
         // let's wait for the networking async task to stop running.
         match handle.await {
@@ -189,14 +209,20 @@ impl AvalancheClient {
                 println!("Sending version message");
                 _ = self
                     .send_message_queue
+                    .as_ref()
+                    .unwrap()
                     .send(AvalancheClient::wrap_message(self.version_message()));
 
                 // Let's send an empty peer_list message as we don't know any other peer.
                 // No ack is expected for such an empty message.
                 println!("Sending peer_list message");
-                _ = self.send_message_queue.send(AvalancheClient::wrap_message(
-                    avalanche::message::Message::PeerList(avalanche::PeerList::new()),
-                ));
+                _ = self
+                    .send_message_queue
+                    .as_ref()
+                    .unwrap()
+                    .send(AvalancheClient::wrap_message(
+                        avalanche::message::Message::PeerList(avalanche::PeerList::new()),
+                    ));
 
                 // Next message must be a PeerList to complete the handshaking
                 self.next_expected_message = MessageType::PeerList;
@@ -221,9 +247,11 @@ impl AvalancheClient {
                     });
 
                     println!("Sending Peer List Ack message");
-                    _ = self.send_message_queue.send(AvalancheClient::wrap_message(
-                        avalanche::message::Message::PeerListAck(ack_message),
-                    ));
+                    _ = self.send_message_queue.as_ref().unwrap().send(
+                        AvalancheClient::wrap_message(avalanche::message::Message::PeerListAck(
+                            ack_message,
+                        )),
+                    );
                 }
 
                 // The handshake is completed afer receiving AND sending the PeerList message.
@@ -246,9 +274,13 @@ impl AvalancheClient {
                 );
 
                 println!("Sending pong message");
-                _ = self.send_message_queue.send(AvalancheClient::wrap_message(
-                    avalanche::message::Message::Pong(avalanche::Pong::new()),
-                ));
+                _ = self
+                    .send_message_queue
+                    .as_ref()
+                    .unwrap()
+                    .send(AvalancheClient::wrap_message(
+                        avalanche::message::Message::Pong(avalanche::Pong::new()),
+                    ));
             }
             // Pong messages are sent as a reply to Ping ones
             Some(avalanche::message::Message::Pong(_)) => {
@@ -274,7 +306,23 @@ impl AvalancheClient {
             unknown_message => return Err(P2pError::UnknownMessage(Box::new(unknown_message))),
         }
 
+        // Update the last message timestamp with the current value
+        self.last_message_timestamp = SystemTime::now();
+
         Ok(())
+    }
+
+    /// Checks whether the remote peer was inactive for more than [`super::INACTIVITY_TIMEOUT`].
+    /// In case of inactivity, an error is returned so that the connection can be closed.
+    fn check_inactivity(&self) -> Result<(), P2pError> {
+        match self.last_message_timestamp.elapsed() {
+            Ok(time) if time < INACTIVITY_TIMEOUT => Ok(()),
+            Ok(_) => Err(P2pError::InactivePeer(INACTIVITY_TIMEOUT)),
+            Err(error) => panic!(
+                "Fatal error, the last received message comes from the future! {}",
+                error
+            ),
+        }
     }
 
     /// Checks whether a message arrives in the right order or not.
@@ -411,7 +459,7 @@ mod tests {
         client.received_message_queue = received_message_receiver;
 
         let (send_message_sender, send_message_receiver) = mpsc::channel::<Message>();
-        client.send_message_queue = send_message_sender;
+        client.send_message_queue = Some(send_message_sender);
 
         let (status_update_sender, status_update_receiver) = mpsc::channel::<ConnectionStatus>();
         client.status_update_receiver = status_update_receiver;
