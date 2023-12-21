@@ -2,14 +2,17 @@ use std::{
     io::{ErrorKind, Read, Write},
     net::TcpStream,
     sync::{mpsc, Arc},
-    time::{Duration, SystemTime},
+    time::Duration,
 };
 
 use protobuf::Message;
 use rustls::{Certificate, ClientConnection, PrivateKey, StreamOwned};
 use tokio::sync::Mutex;
 
-use crate::avalanche::{MAX_MESSAGE_LENGTH, MESSAGE_HEADER_LENGTH};
+use crate::{
+    avalanche::{MAX_MESSAGE_LENGTH, MESSAGE_HEADER_LENGTH},
+    utils::time::TimeContext,
+};
 
 use super::{avalanche, tls, ConnectionStatus, P2pError};
 
@@ -35,6 +38,9 @@ pub struct NetworkHandler {
     /// the connection status.
     status_update_queue: StatusUpdateQueue,
 
+    /// Object that helps handling the time.
+    pub time_context: Arc<TimeContext>,
+
     /// TLS stream for read/write operations.
     tls_stream: Arc<Mutex<Option<StreamOwned<ClientConnection, TcpStream>>>>,
 }
@@ -47,6 +53,7 @@ impl NetworkHandler {
         received_messages_sender: ReceivedMessageQueue,
         send_messages_sender: SendMessageQueue,
         status_update_sender: StatusUpdateQueue,
+        time_context: Arc<TimeContext>,
     ) -> Self {
         Self {
             certificate,
@@ -54,6 +61,7 @@ impl NetworkHandler {
             received_messages_queue: received_messages_sender,
             send_messages_queue: send_messages_sender,
             status_update_queue: status_update_sender,
+            time_context: time_context.clone(),
             tls_stream: Arc::new(Mutex::new(None)),
         }
     }
@@ -84,7 +92,7 @@ impl NetworkHandler {
         self.tls_stream = Arc::new(Mutex::new(Some(StreamOwned::new(tls_connection, stream))));
         _ = self
             .status_update_queue
-            .send(ConnectionStatus::Connected(SystemTime::now().into()));
+            .send(ConnectionStatus::Connected(self.time_context.now().into()));
 
         Ok(())
     }
@@ -130,7 +138,7 @@ impl NetworkHandler {
 
         _ = self
             .status_update_queue
-            .send(ConnectionStatus::Closed(SystemTime::now().into()));
+            .send(ConnectionStatus::Closed(self.time_context.now().into()));
 
         // If the execution reaches this point, the TLS connection was closed.
         Ok(())
@@ -328,12 +336,15 @@ impl NetworkHandler {
 mod tests {
     /// Tests for [`NetworkHandler`] connect() function.
     mod connect {
-        use crate::avalanche::{
-            network::{avalanche::Message, NetworkHandler},
-            ConnectionStatus, P2pError,
+        use crate::{
+            avalanche::{
+                network::{avalanche::Message, NetworkHandler},
+                ConnectionStatus, P2pError,
+            },
+            utils::time::TimeContext,
         };
 
-        use std::sync::mpsc::channel;
+        use std::sync::{mpsc::channel, Arc};
 
         /// Generates a default NetworkHandler for testing purpose
         fn default_network_handler() -> NetworkHandler {
@@ -353,6 +364,7 @@ mod tests {
                 received_messages_sender,
                 send_messages_receiver,
                 status_sender.clone(),
+                Arc::new(TimeContext::new(None)),
             )
         }
 

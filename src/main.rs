@@ -1,7 +1,11 @@
+use std::sync::Arc;
+
 use avalanche::{DEFAULT_INACTIVITY_TIMEOUT, DEFAULT_IP_ADDRESS};
 use clap::Parser;
+use utils::time::TimeContext;
 
 mod avalanche;
+mod utils;
 
 /// Struct containing the command line arguments supported.
 #[derive(Parser, Debug)]
@@ -22,7 +26,11 @@ async fn main() {
     let args = Args::parse();
 
     // Create a client instance to connect to the peer
-    let mut client = match avalanche::AvalancheClient::new(&args.ip_address, args.timeout) {
+    let mut client = match avalanche::AvalancheClient::new(
+        &args.ip_address,
+        args.timeout,
+        Arc::new(TimeContext::new(None)),
+    ) {
         Ok(client) => client,
         Err(error) => {
             println!(

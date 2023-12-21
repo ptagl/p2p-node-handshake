@@ -1,7 +1,10 @@
 use std::{
     net::Ipv6Addr,
     str::FromStr,
-    sync::mpsc::{self, TryRecvError},
+    sync::{
+        mpsc::{self, TryRecvError},
+        Arc,
+    },
     time::{Duration, SystemTime},
 };
 
@@ -9,6 +12,8 @@ use protobuf::Message;
 use rustls::PrivateKey;
 use x509_certificate::Signer;
 use zstd::bulk::decompress;
+
+use crate::utils::time::TimeContext;
 
 use super::{
     avalanche, network::NetworkHandler, ConnectionStatus, MessageType, P2pError, MAX_MESSAGE_LENGTH,
@@ -58,11 +63,18 @@ pub struct AvalancheClient {
 
     /// The queue of status updates from the network layer (sender).
     status_update_sender: StatusUpdateSender,
+
+    /// A structure that provides utilities to get the current time.
+    time_context: Arc<TimeContext>,
 }
 
 impl AvalancheClient {
     /// Creates a new client instance to later connect to the destination address provided.
-    pub fn new(destination_address: &str, inactivity_timeout: u64) -> Result<Self, P2pError> {
+    pub fn new(
+        destination_address: &str,
+        inactivity_timeout: u64,
+        time_context: Arc<TimeContext>,
+    ) -> Result<Self, P2pError> {
         // Generate a private key and a certificate for establishing the TLS connection
         let (private_key, certificate) = cert_manager::x509::generate_der(None)
             .map_err(|error| P2pError::CertificateGenerationError(error.to_string()))?;
@@ -84,12 +96,13 @@ impl AvalancheClient {
             received_messages_sender,
             send_messages_receiver,
             status_sender.clone(),
+            time_context.clone(),
         );
 
         Ok(Self {
             destination_address: destination_address.to_string(),
             inactivity_timeout: Duration::from_secs(inactivity_timeout),
-            last_message_timestamp: SystemTime::now(),
+            last_message_timestamp: time_context.now(),
             network_handler: Some(network_handler),
             next_expected_message: MessageType::Version,
             private_key,
@@ -97,6 +110,7 @@ impl AvalancheClient {
             send_message_queue: Some(send_messages_sender),
             status_update_receiver: status_receiver,
             status_update_sender: status_sender,
+            time_context: time_context.clone(),
         })
     }
 
@@ -108,7 +122,7 @@ impl AvalancheClient {
             panic!("Unexpected error: network_handler was None!");
         }
 
-        self.last_message_timestamp = SystemTime::now();
+        self.last_message_timestamp = self.time_context.now();
 
         Ok(())
     }
@@ -208,7 +222,9 @@ impl AvalancheClient {
 
                 _ = self
                     .status_update_sender
-                    .send(ConnectionStatus::HandshakeStarted(SystemTime::now().into()));
+                    .send(ConnectionStatus::HandshakeStarted(
+                        self.time_context.now().into(),
+                    ));
 
                 println!("Sending version message");
                 _ = self
@@ -264,7 +280,7 @@ impl AvalancheClient {
                 _ = self
                     .status_update_sender
                     .send(ConnectionStatus::HandshakeCompleted(
-                        SystemTime::now().into(),
+                        self.time_context.now().into(),
                     ));
 
                 // Next message could be anything
@@ -311,7 +327,7 @@ impl AvalancheClient {
         }
 
         // Update the last message timestamp with the current value
-        self.last_message_timestamp = SystemTime::now();
+        self.last_message_timestamp = self.time_context.now();
 
         Ok(())
     }
@@ -319,7 +335,7 @@ impl AvalancheClient {
     /// Checks whether the remote peer was inactive for more than [`super::INACTIVITY_TIMEOUT`].
     /// In case of inactivity, an error is returned so that the connection can be closed.
     fn check_inactivity(&self) -> Result<(), P2pError> {
-        match self.last_message_timestamp.elapsed() {
+        match self.time_context.elapsed(&self.last_message_timestamp) {
             Ok(time) if time < self.inactivity_timeout => Ok(()),
             Ok(_) => Err(P2pError::InactivePeer(self.inactivity_timeout)),
             Err(error) => panic!(
@@ -380,7 +396,9 @@ impl AvalancheClient {
         let mut version_message = avalanche::Version::new();
         version_message.network_id = 12345;
         version_message.my_version = "avalanche/1.10.17".to_string();
-        version_message.my_time = SystemTime::now()
+        version_message.my_time = self
+            .time_context
+            .now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_secs();
@@ -431,13 +449,21 @@ impl AvalancheClient {
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::mpsc::{self, Receiver, TryRecvError},
+        ops::Add,
+        sync::{
+            mpsc::{self, Receiver, TryRecvError},
+            Arc,
+        },
         time::{Duration, SystemTime},
     };
 
-    use crate::avalanche::{
-        avalanche::{self, Message},
-        ConnectionStatus, MessageType, P2pError, DEFAULT_INACTIVITY_TIMEOUT, DEFAULT_IP_ADDRESS,
+    use crate::{
+        avalanche::{
+            avalanche::{self, Message},
+            ConnectionStatus, MessageType, P2pError, DEFAULT_INACTIVITY_TIMEOUT,
+            DEFAULT_IP_ADDRESS,
+        },
+        utils::time::TimeContext,
     };
 
     use super::AvalancheClient;
@@ -453,9 +479,13 @@ mod tests {
     }
 
     /// Creates a default client for tests.
-    fn default_client() -> (AvalancheClient, ClientTestChannels) {
-        let mut client =
-            AvalancheClient::new(DEFAULT_IP_ADDRESS, DEFAULT_INACTIVITY_TIMEOUT).unwrap();
+    fn default_client(time: Option<SystemTime>) -> (AvalancheClient, ClientTestChannels) {
+        let mut client = AvalancheClient::new(
+            DEFAULT_IP_ADDRESS,
+            DEFAULT_INACTIVITY_TIMEOUT,
+            Arc::new(TimeContext::new(time)),
+        )
+        .unwrap();
 
         // Creates channels to be used by tests. We use the same side used
         // by the network handler to trigger client actions (e.g. simulate
@@ -482,7 +512,7 @@ mod tests {
     /// The first expected message must always be Version.
     #[test]
     fn default_expected_message() {
-        let (client, _) = default_client();
+        let (client, _) = default_client(None);
         assert_eq!(client.next_expected_message, MessageType::Version);
     }
 
@@ -493,7 +523,7 @@ mod tests {
     ) {
         // Send all the invalid messages and check the client returns an error
         for wrapper in invalid_messages {
-            let (mut client, channels) = default_client();
+            let (mut client, channels) = default_client(None);
             client.next_expected_message = expected_message_type;
             channels
                 .received_message_queue
@@ -578,7 +608,7 @@ mod tests {
     /// Check expected handshake sequence (1. Version, 2. PeerList).
     #[tokio::test]
     async fn right_handshake_sequence() {
-        let (client, channels) = default_client();
+        let (client, channels) = default_client(None);
 
         assert_eq!(client.next_expected_message, MessageType::Version);
 
@@ -615,6 +645,7 @@ mod tests {
         // a connection closed.
         channels
             .status_update_sender
+            // We should not use the system time here but rather the TimeContext struct
             .send(ConnectionStatus::Closed(SystemTime::now().into()))
             .unwrap();
 
@@ -623,5 +654,131 @@ mod tests {
 
         // // Check that we are ready to receive any message
         assert_eq!(client.next_expected_message, MessageType::Any);
+    }
+
+    /// Check that after the inacvitivity timeout expires
+    /// the connection with the remote peer is closed.
+    #[test]
+    fn check_inactivity_timeout() {
+        let (mut client, _) = default_client(Some(SystemTime::UNIX_EPOCH));
+
+        // Let's notify the client that the handshake is completed
+        client.next_expected_message = MessageType::Any;
+
+        // If the default timeout is 60 seconds, let's use 29 as duration
+        let duration = Duration::from_secs(DEFAULT_INACTIVITY_TIMEOUT / 2 - 1);
+
+        // Based on the duration chosen, we expect the following:
+        // Iteration 1: the peer was inactive for 0 seconds  => OK
+        // Iteration 2: the peer was inactive for 29 seconds => OK
+        // Iteration 3: the peer was inactive for 58 seconds => OK
+        for _ in 0..3 {
+            // Check the peer is not considered inactive
+            assert!(client.check_inactivity().is_ok());
+
+            // Move the time ahead
+            client
+                .time_context
+                .set_time(client.time_context.now().add(duration));
+        }
+
+        // Now the peer should be inactive for 87 seconds
+        assert_eq!(
+            client.check_inactivity().unwrap_err(),
+            P2pError::InactivePeer(client.inactivity_timeout)
+        );
+
+        // Go back in time so that the inactivity is almost 60 seconds (minus just 1 nanosecond)
+        client.time_context.set_time(
+            client
+                .last_message_timestamp
+                .add(client.inactivity_timeout - Duration::from_nanos(1)),
+        );
+
+        // The peer must be considered active
+        assert!(client.check_inactivity().is_ok());
+
+        // Move 1 nanosecond ahead to trigger the inactivity timeout
+        _ = client
+            .time_context
+            .set_time(client.time_context.now().add(Duration::from_nanos(1)));
+
+        // The peer must be considered inactive now
+        assert_eq!(
+            client.check_inactivity().unwrap_err(),
+            P2pError::InactivePeer(client.inactivity_timeout)
+        );
+    }
+
+    /// Check that the inactivity timeout validation fails
+    /// if the last timestamp is wrong (comes from the future).
+    #[test]
+    #[should_panic]
+    fn check_inactivity_timeout_future_error() {
+        let (mut client, _) = default_client(None);
+
+        // Move the last message timestamp to the future (1 minute)
+        client.last_message_timestamp = client.time_context.now().add(Duration::from_secs(60));
+
+        // The check should detect the inconsistency and panic as this is symptom of a major flaw
+        _ = client.check_inactivity();
+    }
+
+    /// Check that the TimeContext used by the [`AvalancheClient`] and the [`crate::avalanche::network::NetworkHandler`]
+    /// are always aligned (through the Arc pointer).
+    #[test]
+    fn check_clocks_synchronization() {
+        // Init the TimeContext with None, meaning that we want to use the real clock
+        let (client, _) = default_client(None);
+        let network_handler = client.network_handler.unwrap();
+
+        // Check that client and network handler times are different but just for less than 1 millisecond
+        let time_1 = client.time_context.now();
+        let time_2 = network_handler.time_context.now();
+        assert!(time_2.duration_since(time_1).unwrap() < Duration::from_millis(1));
+
+        // Switch to mock time
+        client.time_context.set_time(SystemTime::UNIX_EPOCH);
+        assert_eq!(
+            client.time_context.now(),
+            network_handler.time_context.now()
+        );
+
+        // Move client time 10 seconds ahead
+        client
+            .time_context
+            .set_time(SystemTime::UNIX_EPOCH.add(Duration::from_secs(10)));
+
+        // Check that both client and network handler times match...
+        assert_eq!(
+            client.time_context.now(),
+            network_handler.time_context.now()
+        );
+
+        // ... and that the value is as expected
+        assert_eq!(
+            client.time_context.now(),
+            SystemTime::UNIX_EPOCH.add(Duration::from_secs(10))
+        );
+
+        // Move network handler time 10 seconds ahead
+        network_handler.time_context.set_time(
+            network_handler
+                .time_context
+                .now()
+                .add(Duration::from_secs(10)),
+        );
+
+        // Check that both client and network handler times match...
+        assert_eq!(
+            client.time_context.now(),
+            network_handler.time_context.now()
+        );
+
+        // ... and that the value is as expected
+        assert_eq!(
+            client.time_context.now(),
+            SystemTime::UNIX_EPOCH.add(Duration::from_secs(20))
+        );
     }
 }
