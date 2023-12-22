@@ -7,7 +7,11 @@ mod tls;
 pub use p2p::AvalancheClient;
 
 use chrono::{DateTime, Utc};
-use std::{fmt::Display, time::Duration};
+use std::{
+    fmt::Display,
+    sync::mpsc::{self, TrySendError},
+    time::Duration,
+};
 use tokio::task::JoinError;
 
 /// Default inactivity timeout after which remote peers get disconnected (seconds).
@@ -22,6 +26,28 @@ const MESSAGE_HEADER_LENGTH: usize = 4;
 /// This constant is to prevent DoS attacks from malicious nodes.
 /// For instance, we don't want to parse a message whose size is 10 GB and make the application crash.
 const MAX_MESSAGE_LENGTH: usize = 1024 * 1024 * 4; // 4 MB
+
+/// Max number of messages allowed in an MPSC channel of P2P messages.
+/// This is a DoS protection mechanism to avoid that a peer that is
+/// too fast (at sending messages) or too slow (at processing our messages)
+/// could make the queues grow unbounded causing an out of memory.
+/// The value is not ideal, but depends on the fact that MPSC channels
+/// don't expose a method for getting the size in bytes, so we are more
+/// generally limiting the number of messages.
+/// Given the presence of [`MAX_MESSAGE_LENGTH`], this means that we cannot
+/// have received messages channels with more than 40 MB of messages.
+/// Send messages channels are expected to be way smaller as the client
+/// doesn't handle big messages.
+///
+/// TODO: find a channel communication system that gives access to the
+/// current size of the queue (or wrap MPSC channels with our own implementation).
+const MAX_MESSAGE_QUEUE_SIZE: usize = 10;
+
+/// The idea is the same as [`MAX_MESSAGE_QUEUE_SIZE`]. In this case, the queue
+/// should not grow depending on the behavior of the remote peer, considering
+/// that this is just a way to communicate the current state of the node and
+/// that possible states are limited.
+const MAX_STATUS_UPDATE_QUEUE_SIZE: usize = 5;
 
 // Include the protobuf generated code for the Avalanche P2P messages
 include!(concat!(env!("OUT_DIR"), "/protos/mod.rs"));
@@ -47,6 +73,8 @@ pub enum P2pError {
     InvalidServerName(String, String),
     /// Unable to deserialize the message.
     MessageDeserializationError(Vec<u8>, String),
+    /// The connection with the peer was closed.
+    PeerDisconnected(),
     /// Error while configuring the socket stream.
     StreamConfigurationError(String),
     /// Unexpected error in the TCP stream.
@@ -121,6 +149,9 @@ impl Display for P2pError {
                 "#,
                     error_message, bytes,
                 )
+            }
+            Self::PeerDisconnected() => {
+                write!(f, "Peer disconnected")
             }
             Self::StreamConfigurationError(error_message) => {
                 write!(f, "Stream configuration error: {}", error_message)
@@ -233,4 +264,17 @@ pub enum MessageType {
     /// Any message type, it could be sent after having received a PeerList message,
     /// indicating the successful completion of the handshake procedure.
     Any,
+}
+
+/// Helper function that makes an attempt to queue a message into an MPSC channel.
+/// In case of failure:
+/// - If the error is "FULL", then the message is just discarded
+/// - If the error is "DISCONNECTED", then the error is translated into a [`P2pError`]
+fn queue_message<T>(queue: &mpsc::SyncSender<T>, message: T) -> Result<(), P2pError> {
+    // try_send() is non-blocking, returning a FULL error if the channel has reached the size limit, in which case we just skip the message (it may have special handling in production software)
+    if let Err(TrySendError::Disconnected(_)) = queue.try_send(message) {
+        return Err(P2pError::PeerDisconnected());
+    }
+
+    Ok(())
 }

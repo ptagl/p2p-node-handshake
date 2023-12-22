@@ -13,19 +13,20 @@ use rustls::PrivateKey;
 use x509_certificate::Signer;
 use zstd::bulk::decompress;
 
-use crate::utils::time::TimeContext;
+use crate::{avalanche::queue_message, utils::time::TimeContext};
 
 use super::{
     avalanche,
     config::{self, Configuration},
     network::NetworkHandler,
-    ConnectionStatus, MessageType, P2pError, MAX_MESSAGE_LENGTH,
+    ConnectionStatus, MessageType, P2pError, MAX_MESSAGE_LENGTH, MAX_MESSAGE_QUEUE_SIZE,
+    MAX_STATUS_UPDATE_QUEUE_SIZE,
 };
 
 type ReceivedMessageQueue = mpsc::Receiver<avalanche::Message>;
-type SendMessageQueue = mpsc::Sender<avalanche::Message>;
+type SendMessageQueue = mpsc::SyncSender<avalanche::Message>;
 type StatusUpdateReceiver = mpsc::Receiver<ConnectionStatus>;
-type StatusUpdateSender = mpsc::Sender<ConnectionStatus>;
+type StatusUpdateSender = mpsc::SyncSender<ConnectionStatus>;
 
 /// It handles the communication with Avalanche nodes.
 #[derive(Debug)]
@@ -86,13 +87,15 @@ impl AvalancheClient {
 
         // Received messages channel
         let (received_messages_sender, received_message_receiver) =
-            mpsc::channel::<avalanche::Message>();
+            mpsc::sync_channel::<avalanche::Message>(MAX_MESSAGE_QUEUE_SIZE);
 
         // Send messages channel
-        let (send_messages_sender, send_messages_receiver) = mpsc::channel::<avalanche::Message>();
+        let (send_messages_sender, send_messages_receiver) =
+            mpsc::sync_channel::<avalanche::Message>(MAX_MESSAGE_QUEUE_SIZE);
 
         // Status update channel
-        let (status_sender, status_receiver) = mpsc::channel::<ConnectionStatus>();
+        let (status_sender, status_receiver) =
+            mpsc::sync_channel::<ConnectionStatus>(MAX_STATUS_UPDATE_QUEUE_SIZE);
 
         // Create an object that will handle the network communication
         let network_handler = NetworkHandler::new(
@@ -226,29 +229,26 @@ impl AvalancheClient {
                 );
                 println!("Received version message");
 
-                _ = self
-                    .status_update_sender
-                    .send(ConnectionStatus::HandshakeStarted(
-                        self.time_context.now().into(),
-                    ));
+                queue_message(
+                    &self.status_update_sender,
+                    ConnectionStatus::HandshakeStarted(self.time_context.now().into()),
+                )?;
 
                 println!("Sending version message");
-                _ = self
-                    .send_message_queue
-                    .as_ref()
-                    .unwrap()
-                    .send(AvalancheClient::wrap_message(self.version_message()));
+                queue_message(
+                    self.send_message_queue.as_ref().unwrap(),
+                    AvalancheClient::wrap_message(self.version_message()),
+                )?;
 
                 // Let's send an empty peer_list message as we don't know any other peer.
                 // No ack is expected for such an empty message.
                 println!("Sending peer_list message");
-                _ = self
-                    .send_message_queue
-                    .as_ref()
-                    .unwrap()
-                    .send(AvalancheClient::wrap_message(
-                        avalanche::message::Message::PeerList(avalanche::PeerList::new()),
-                    ));
+                queue_message(
+                    self.send_message_queue.as_ref().unwrap(),
+                    AvalancheClient::wrap_message(avalanche::message::Message::PeerList(
+                        avalanche::PeerList::new(),
+                    )),
+                )?;
 
                 // Next message must be a PeerList to complete the handshaking
                 self.next_expected_message = MessageType::PeerList;
@@ -273,21 +273,21 @@ impl AvalancheClient {
                     });
 
                     println!("Sending Peer List Ack message");
-                    _ = self.send_message_queue.as_ref().unwrap().send(
+                    queue_message(
+                        self.send_message_queue.as_ref().unwrap(),
                         AvalancheClient::wrap_message(avalanche::message::Message::PeerListAck(
                             ack_message,
                         )),
-                    );
+                    )?;
                 }
 
                 // The handshake is completed after receiving AND sending the PeerList message.
                 // The message from our side has been already sent together with the Version one,
                 // otherwise we wouldn't accept the incoming PeerList (see self.check_message_order()).
-                _ = self
-                    .status_update_sender
-                    .send(ConnectionStatus::HandshakeCompleted(
-                        self.time_context.now().into(),
-                    ));
+                queue_message(
+                    &self.status_update_sender,
+                    ConnectionStatus::HandshakeCompleted(self.time_context.now().into()),
+                )?;
 
                 // Next message could be anything
                 self.next_expected_message = MessageType::Any;
@@ -300,13 +300,12 @@ impl AvalancheClient {
                 );
 
                 println!("Sending pong message");
-                _ = self
-                    .send_message_queue
-                    .as_ref()
-                    .unwrap()
-                    .send(AvalancheClient::wrap_message(
-                        avalanche::message::Message::Pong(avalanche::Pong::new()),
-                    ));
+                queue_message(
+                    self.send_message_queue.as_ref().unwrap(),
+                    AvalancheClient::wrap_message(avalanche::message::Message::Pong(
+                        avalanche::Pong::new(),
+                    )),
+                )?;
             }
             // Pong messages are sent as a reply to Ping ones
             Some(avalanche::message::Message::Pong(_)) => {
@@ -471,16 +470,17 @@ mod tests {
         avalanche::{
             avalanche::{self, Message},
             config::Configuration,
-            ConnectionStatus, MessageType, P2pError, DEFAULT_INACTIVITY_TIMEOUT,
+            queue_message, ConnectionStatus, MessageType, P2pError, DEFAULT_INACTIVITY_TIMEOUT,
+            MAX_MESSAGE_QUEUE_SIZE, MAX_STATUS_UPDATE_QUEUE_SIZE,
         },
         utils::time::TimeContext,
     };
 
     use super::AvalancheClient;
 
-    type ReceivedMessageQueue = mpsc::Sender<Message>;
+    type ReceivedMessageQueue = mpsc::SyncSender<Message>;
     type SendMessageQueue = mpsc::Receiver<Message>;
-    type StatusUpdateSender = mpsc::Sender<ConnectionStatus>;
+    type StatusUpdateSender = mpsc::SyncSender<ConnectionStatus>;
 
     /// A wrapper that stores all the MPSC queues that can be useful for unit testing
     /// the [`AvalancheClient`] implementation.
@@ -499,13 +499,16 @@ mod tests {
         // Creates channels to be used by tests. We use the same side used
         // by the network handler to trigger client actions (e.g. simulate
         // a new message arrived from the socket).
-        let (received_message_sender, received_message_receiver) = mpsc::channel::<Message>();
+        let (received_message_sender, received_message_receiver) =
+            mpsc::sync_channel::<Message>(MAX_MESSAGE_QUEUE_SIZE);
         client.received_message_queue = received_message_receiver;
 
-        let (send_message_sender, send_message_receiver) = mpsc::channel::<Message>();
+        let (send_message_sender, send_message_receiver) =
+            mpsc::sync_channel::<Message>(MAX_MESSAGE_QUEUE_SIZE);
         client.send_message_queue = Some(send_message_sender);
 
-        let (status_update_sender, status_update_receiver) = mpsc::channel::<ConnectionStatus>();
+        let (status_update_sender, status_update_receiver) =
+            mpsc::sync_channel::<ConnectionStatus>(MAX_STATUS_UPDATE_QUEUE_SIZE);
         client.status_update_receiver = status_update_receiver;
         client.status_update_sender = status_update_sender.clone();
 
@@ -534,10 +537,7 @@ mod tests {
         for wrapper in invalid_messages {
             let (mut client, channels) = default_client(None);
             client.next_expected_message = expected_message_type;
-            channels
-                .received_message_queue
-                .send(wrapper.clone())
-                .unwrap();
+            queue_message(&channels.received_message_queue, wrapper.clone()).unwrap();
 
             let error = client.run_client().await.unwrap_err();
 
@@ -630,7 +630,7 @@ mod tests {
             )),
         ]
         .into_iter()
-        .for_each(|message| channels.received_message_queue.send(message).unwrap());
+        .for_each(|message| queue_message(&channels.received_message_queue, message).unwrap());
 
         let handle = tokio::spawn(client.run_all());
 
@@ -654,11 +654,12 @@ mod tests {
 
         // Force the client to stop the async processing by simulating
         // a connection closed.
-        channels
-            .status_update_sender
+        queue_message(
+            &channels.status_update_sender,
             // We should not use the system time here but rather the TimeContext struct
-            .send(ConnectionStatus::Closed(SystemTime::now().into()))
-            .unwrap();
+            ConnectionStatus::Closed(SystemTime::now().into()),
+        )
+        .unwrap();
 
         // Wait for the async task to complete and return the client
         let client = handle.await.unwrap().unwrap();

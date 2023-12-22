@@ -14,11 +14,11 @@ use crate::{
     utils::time::TimeContext,
 };
 
-use super::{avalanche, tls, ConnectionStatus, P2pError};
+use super::{avalanche, queue_message, tls, ConnectionStatus, P2pError};
 
-type ReceivedMessageQueue = mpsc::Sender<avalanche::Message>;
+type ReceivedMessageQueue = mpsc::SyncSender<avalanche::Message>;
 type SendMessageQueue = mpsc::Receiver<avalanche::Message>;
-type StatusUpdateQueue = mpsc::Sender<ConnectionStatus>;
+type StatusUpdateQueue = mpsc::SyncSender<ConnectionStatus>;
 
 /// Struct that handles a TLS connection with its network stream.
 /// The stream is used by 2 threads, one for reading and one for
@@ -95,10 +95,14 @@ impl NetworkHandler {
             P2pError::StreamConfigurationError(error.to_string())
         })?;
 
+        // Create the shared stream
         self.tls_stream = Arc::new(Mutex::new(Some(StreamOwned::new(tls_connection, stream))));
-        _ = self
-            .status_update_queue
-            .send(ConnectionStatus::Connected(self.time_context.now().into()));
+
+        // Notify the new connection state
+        queue_message(
+            &self.status_update_queue,
+            ConnectionStatus::Connected(self.time_context.now().into()),
+        )?;
 
         Ok(())
     }
@@ -142,9 +146,13 @@ impl NetworkHandler {
             }
         }
 
-        _ = self
-            .status_update_queue
-            .send(ConnectionStatus::Closed(self.time_context.now().into()));
+        // Notify that the connection was closed. In case of errors sending the notification
+        // (e.g. the upper layer already stopped listening), we can just ignore and return,
+        // no need to handle the error.
+        _ = queue_message(
+            &self.status_update_queue,
+            ConnectionStatus::Closed(self.time_context.now().into()),
+        );
 
         // If the execution reaches this point, the TLS connection was closed.
         Ok(())
@@ -265,7 +273,7 @@ impl NetworkHandler {
 
             // If queuing the message fails, it means that the top layer stopped listening,
             // so we can stop reading from the socket.
-            if received_message_queue.send(message).is_err() {
+            if queue_message(&received_message_queue, message).is_err() {
                 disconnect!(stream);
                 return Ok(());
             }
@@ -345,23 +353,23 @@ mod tests {
         use crate::{
             avalanche::{
                 network::{avalanche::Message, NetworkHandler},
-                ConnectionStatus, P2pError,
+                ConnectionStatus, P2pError, MAX_MESSAGE_QUEUE_SIZE, MAX_STATUS_UPDATE_QUEUE_SIZE,
             },
             utils::time::TimeContext,
         };
 
-        use std::sync::{mpsc::channel, Arc};
+        use std::sync::{mpsc::sync_channel, Arc};
 
         /// Generates a default NetworkHandler for testing purpose.
         fn default_network_handler() -> NetworkHandler {
             let (private_key, certificate) = cert_manager::x509::generate_der(None).unwrap();
-            let (received_messages_sender, _) = channel::<Message>();
+            let (received_messages_sender, _) = sync_channel::<Message>(MAX_MESSAGE_QUEUE_SIZE);
 
             // Send messages channel
-            let (_, send_messages_receiver) = channel::<Message>();
+            let (_, send_messages_receiver) = sync_channel::<Message>(MAX_MESSAGE_QUEUE_SIZE);
 
             // Status update channel
-            let (status_sender, _) = channel::<ConnectionStatus>();
+            let (status_sender, _) = sync_channel::<ConnectionStatus>(MAX_STATUS_UPDATE_QUEUE_SIZE);
 
             // Create an object that will handle the network communication
             NetworkHandler::new(
