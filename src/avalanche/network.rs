@@ -20,6 +20,12 @@ type ReceivedMessageQueue = mpsc::Sender<avalanche::Message>;
 type SendMessageQueue = mpsc::Receiver<avalanche::Message>;
 type StatusUpdateQueue = mpsc::Sender<ConnectionStatus>;
 
+/// Struct that handles a TLS connection with its network stream.
+/// The stream is used by 2 threads, one for reading and one for
+/// writing bytes.
+/// Two communication channels are included to communicate with
+/// higher layers, so that deserialized messages can be delivered
+/// and incoming ones are serialized and sent to the remote peer.
 #[derive(Debug)]
 pub struct NetworkHandler {
     /// Certificate for the TLS connection
@@ -346,7 +352,7 @@ mod tests {
 
         use std::sync::{mpsc::channel, Arc};
 
-        /// Generates a default NetworkHandler for testing purpose
+        /// Generates a default NetworkHandler for testing purpose.
         fn default_network_handler() -> NetworkHandler {
             let (private_key, certificate) = cert_manager::x509::generate_der(None).unwrap();
             let (received_messages_sender, _) = channel::<Message>();
@@ -368,6 +374,7 @@ mod tests {
             )
         }
 
+        /// Check the returned error when not providing the destination IP port.
         #[test]
         fn ip_address_without_port() {
             let mut network_handler = default_network_handler();
@@ -381,6 +388,7 @@ mod tests {
             );
         }
 
+        /// Check the returned error when trying to connect to an invalid IP port.
         #[test]
         fn invalid_ip_port() {
             let mut network_handler = default_network_handler();
@@ -395,6 +403,7 @@ mod tests {
             );
         }
 
+        /// Check the returned error when connecting to an existing peer but on an unavailable port.
         #[test]
         fn server_not_available() {
             let mut network_handler = default_network_handler();

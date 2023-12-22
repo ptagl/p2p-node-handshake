@@ -185,10 +185,10 @@ impl AvalancheClient {
             Err(error) => println!("Process message error: {}", error),
         }
 
-        // Close the channels with the NetworkHandler to make it close the connection and stop.
+        // Close the channels with the NetworkHandler to make it shutdown the connection and stop.
         // This is useful when the run_client() function returns an error that does not depend
         // on the network layer (for instance in case of inactivity timeout), otherwise the
-        // NetworkHandler would stop on its own.
+        // NetworkHandler would not stop on its own.
         drop(self.send_message_queue.take());
 
         // If the execution reaches this point, the TLS connection was closed,
@@ -426,6 +426,9 @@ impl AvalancheClient {
         avalanche::message::Message::Version(version_message)
     }
 
+    /// Helper function that takes a specific P2P message and wraps it into
+    /// the higher-level message data structure that can be used to be sent
+    /// through the network.
     fn wrap_message(message: avalanche::message::Message) -> avalanche::Message {
         let mut wrapped_message = avalanche::Message::new();
 
@@ -472,6 +475,8 @@ mod tests {
     type SendMessageQueue = mpsc::Receiver<Message>;
     type StatusUpdateSender = mpsc::Sender<ConnectionStatus>;
 
+    /// A wrapper that stores all the MPSC queues that can be useful for unit testing
+    /// the [`AvalancheClient`] implementation.
     struct ClientTestChannels {
         received_message_queue: ReceivedMessageQueue,
         send_message_queue: SendMessageQueue,
@@ -549,6 +554,8 @@ mod tests {
         }
     }
 
+    /// Helper function to wait for a message to be received through a
+    /// MPSC receiver. It is done in a non-blocking way.
     async fn wait_for_message<T>(receiver: &Receiver<T>) -> Result<T, ()> {
         loop {
             tokio::time::sleep(Duration::from_millis(100)).await;
