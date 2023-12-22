@@ -146,7 +146,7 @@ impl NetworkHandler {
 
     /// Starts reading bytes from the socket until one of the
     /// following things happen:
-    /// - an error occurrs
+    /// - an error occurs
     /// - the connection is closed
     #[allow(clippy::read_zero_byte_vec)] // False positive, see https://github.com/rust-lang/rust-clippy/issues/9274
     async fn read_bytes(
@@ -223,7 +223,7 @@ impl NetworkHandler {
                         return Err(P2pError::InvalidMessageSize(len, MAX_MESSAGE_LENGTH));
                     }
                     0 => {
-                        // This is odd, the header includes a "null" size, but it's not possible to have an emptyu message.
+                        // This is odd, the header includes a "null" size, but it's not possible to have an empty message.
                         // We don't expect anything good to come after that, but let's try to be optimistic
                         // and just skip this header instead of closing the connection.
                         continue;

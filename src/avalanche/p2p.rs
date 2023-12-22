@@ -203,7 +203,7 @@ impl AvalancheClient {
 
     /// Handles an incoming P2P message read from the network
     fn process_message(&mut self, message_wrapper: avalanche::Message) -> Result<(), P2pError> {
-        // Check message ordering to detect potential misbheaving nodes.
+        // Check message ordering to detect potential misbehaving nodes.
         // Sending messages in the wrong order is considered malicious,
         // and the remote peer gets disconnected.
         // This mechanism could be improved with the implementation of a ban score system
@@ -274,7 +274,7 @@ impl AvalancheClient {
                     );
                 }
 
-                // The handshake is completed afer receiving AND sending the PeerList message.
+                // The handshake is completed after receiving AND sending the PeerList message.
                 // The message from our side has been already sent together with the Version one,
                 // otherwise we wouldn't accept the incoming PeerList (see self.check_message_order()).
                 _ = self
@@ -656,7 +656,7 @@ mod tests {
         assert_eq!(client.next_expected_message, MessageType::Any);
     }
 
-    /// Check that after the inacvitivity timeout expires
+    /// Check that after the inactivity timeout expires
     /// the connection with the remote peer is closed.
     #[test]
     fn check_inactivity_timeout() {
