@@ -16,7 +16,10 @@ use zstd::bulk::decompress;
 use crate::utils::time::TimeContext;
 
 use super::{
-    avalanche, network::NetworkHandler, ConnectionStatus, MessageType, P2pError, MAX_MESSAGE_LENGTH,
+    avalanche,
+    config::{self, Configuration},
+    network::NetworkHandler,
+    ConnectionStatus, MessageType, P2pError, MAX_MESSAGE_LENGTH,
 };
 
 type ReceivedMessageQueue = mpsc::Receiver<avalanche::Message>;
@@ -66,13 +69,15 @@ pub struct AvalancheClient {
 
     /// A structure that provides utilities to get the current time.
     time_context: Arc<TimeContext>,
+
+    /// Configuration to be used when generating P2P Version messages.
+    version_message_configuration: config::VersionMessage,
 }
 
 impl AvalancheClient {
     /// Creates a new client instance to later connect to the destination address provided.
     pub fn new(
-        destination_address: &str,
-        inactivity_timeout: u64,
+        configuration: Configuration,
         time_context: Arc<TimeContext>,
     ) -> Result<Self, P2pError> {
         // Generate a private key and a certificate for establishing the TLS connection
@@ -100,8 +105,8 @@ impl AvalancheClient {
         );
 
         Ok(Self {
-            destination_address: destination_address.to_string(),
-            inactivity_timeout: Duration::from_secs(inactivity_timeout),
+            destination_address: configuration.destination_address,
+            inactivity_timeout: Duration::from_secs(configuration.inactivity_timeout),
             last_message_timestamp: time_context.now(),
             network_handler: Some(network_handler),
             next_expected_message: MessageType::Version,
@@ -111,6 +116,7 @@ impl AvalancheClient {
             status_update_receiver: status_receiver,
             status_update_sender: status_sender,
             time_context: time_context.clone(),
+            version_message_configuration: configuration.version_message,
         })
     }
 
@@ -394,8 +400,8 @@ impl AvalancheClient {
     /// Generates a version message to be sent for handshaking.
     fn version_message(&self) -> avalanche::message::Message {
         let mut version_message = avalanche::Version::new();
-        version_message.network_id = 12345;
-        version_message.my_version = "avalanche/1.10.17".to_string();
+        version_message.network_id = self.version_message_configuration.network_id;
+        version_message.my_version = self.version_message_configuration.version_string.clone();
         version_message.my_time = self
             .time_context
             .now()
@@ -403,12 +409,13 @@ impl AvalancheClient {
             .unwrap()
             .as_secs();
         version_message.my_version_time = version_message.my_time;
-        version_message.ip_addr = std::net::Ipv4Addr::from_str("127.0.0.1")
-            .unwrap()
-            .to_ipv6_mapped()
-            .octets()
-            .to_vec();
-        version_message.ip_port = 9651_u32;
+        version_message.ip_addr =
+            std::net::Ipv4Addr::from_str(&self.version_message_configuration.ip_address)
+                .unwrap()
+                .to_ipv6_mapped()
+                .octets()
+                .to_vec();
+        version_message.ip_port = self.version_message_configuration.ip_port;
 
         let to_sign = [
             version_message.ip_addr.clone(),
@@ -463,8 +470,8 @@ mod tests {
     use crate::{
         avalanche::{
             avalanche::{self, Message},
+            config::Configuration,
             ConnectionStatus, MessageType, P2pError, DEFAULT_INACTIVITY_TIMEOUT,
-            DEFAULT_IP_ADDRESS,
         },
         utils::time::TimeContext,
     };
@@ -485,12 +492,9 @@ mod tests {
 
     /// Creates a default client for tests.
     fn default_client(time: Option<SystemTime>) -> (AvalancheClient, ClientTestChannels) {
-        let mut client = AvalancheClient::new(
-            DEFAULT_IP_ADDRESS,
-            DEFAULT_INACTIVITY_TIMEOUT,
-            Arc::new(TimeContext::new(time)),
-        )
-        .unwrap();
+        let mut client =
+            AvalancheClient::new(Configuration::default(), Arc::new(TimeContext::new(time)))
+                .unwrap();
 
         // Creates channels to be used by tests. We use the same side used
         // by the network handler to trigger client actions (e.g. simulate

@@ -1,0 +1,21 @@
+# YAML configuration file for the Avalanche handshaking client
+# Configuration may be overwritten by command line arguments when launching the application
+
+## Generic parameters for controlling the client behavior
+
+# Destination address of the node to which the client should connect
+destination_address: "127.0.0.1:9651"
+
+# Timeout (seconds) after which we disconnect the remote peer if no message is received
+inactivity_timeout: 60
+
+## Configuration for the Version message sent during the handshaking procedure
+version_message:
+  # Identifier of the network type on which the client is trying to connect (Mainnet, Testnet, etc.)
+  network_id: 12345
+  # Identifier of the version used by the client
+  version_string: "avalanche/1.10.17"
+  # Advertised IP address
+  ip_address: "127.0.0.1"
+  # Advertised IP port
+  ip_port: 9651

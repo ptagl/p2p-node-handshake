@@ -10,6 +10,8 @@ chrono = "0.4.31"
 clap = { version = "4.4.11", features = ["derive"] }
 protobuf = "3"
 rustls = { version = "0.21.5", features = ["dangerous_configuration"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
 tokio = { version = "1.35.0", features = ["full"] }
 x509-certificate = "0.23.1"
 zstd = "0.13.0"

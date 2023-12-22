@@ -1,36 +1,18 @@
 use std::sync::Arc;
 
-use avalanche::{DEFAULT_INACTIVITY_TIMEOUT, DEFAULT_IP_ADDRESS};
-use clap::Parser;
 use utils::time::TimeContext;
 
 mod avalanche;
 mod utils;
 
-/// Struct containing the command line arguments supported.
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
-struct Args {
-    /// IP address of the destination peer as [ADDRESS]:[PORT]
-    #[arg(short, long, default_value_t = String::from(DEFAULT_IP_ADDRESS))]
-    ip_address: String,
-
-    /// Inactivity timeout for P2P communications (seconds)
-    #[arg(short, long, default_value_t = DEFAULT_INACTIVITY_TIMEOUT)]
-    timeout: u64,
-}
-
 #[tokio::main]
 async fn main() {
-    // Parse the command line arguments
-    let args = Args::parse();
+    // Parse the configuration or get the default values.
+    let config = avalanche::config::Configuration::new();
 
     // Create a client instance to connect to the peer
-    let mut client = match avalanche::AvalancheClient::new(
-        &args.ip_address,
-        args.timeout,
-        Arc::new(TimeContext::new(None)),
-    ) {
+    let mut client = match avalanche::AvalancheClient::new(config, Arc::new(TimeContext::new(None)))
+    {
         Ok(client) => client,
         Err(error) => {
             println!(
