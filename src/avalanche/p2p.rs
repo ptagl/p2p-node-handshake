@@ -16,11 +16,8 @@ use zstd::bulk::decompress;
 use crate::{avalanche::queue_message, utils::time::TimeContext};
 
 use super::{
-    avalanche,
-    config::{self, Configuration},
-    network::NetworkHandler,
-    ConnectionStatus, MessageType, P2pError, MAX_MESSAGE_LENGTH, MAX_MESSAGE_QUEUE_SIZE,
-    MAX_STATUS_UPDATE_QUEUE_SIZE,
+    avalanche, config::Configuration, network::NetworkHandler, ConnectionStatus, MessageType,
+    P2pError, MAX_MESSAGE_LENGTH, MAX_MESSAGE_QUEUE_SIZE, MAX_STATUS_UPDATE_QUEUE_SIZE,
 };
 
 type ReceivedMessageQueue = mpsc::Receiver<avalanche::Message>;
@@ -31,12 +28,13 @@ type StatusUpdateSender = mpsc::SyncSender<ConnectionStatus>;
 /// It handles the communication with Avalanche nodes.
 #[derive(Debug)]
 pub struct AvalancheClient {
-    /// Address of the remote peer.
-    destination_address: String,
+    /// Configuration of the client.
+    configuration: Configuration,
 
-    /// Inactivity timeout for connected peers. Peers are required to send
-    /// at least one message within the timeout period to not be disconnected.
-    inactivity_timeout: Duration,
+    /// When the handshake procedure was completed successfully.
+    /// It is used to eventually close the communication from our side,
+    /// based on the client configuration.
+    handshake_completion_timestamp: Option<SystemTime>,
 
     /// Timestamp of the last message received. This is used to implement a
     /// protection mechanism and disconnect peers after an inactivity timeout.
@@ -70,9 +68,6 @@ pub struct AvalancheClient {
 
     /// A structure that provides utilities to get the current time.
     time_context: Arc<TimeContext>,
-
-    /// Configuration to be used when generating P2P Version messages.
-    version_message_configuration: config::VersionMessage,
 }
 
 impl AvalancheClient {
@@ -108,8 +103,8 @@ impl AvalancheClient {
         );
 
         Ok(Self {
-            destination_address: configuration.destination_address,
-            inactivity_timeout: Duration::from_secs(configuration.inactivity_timeout),
+            configuration,
+            handshake_completion_timestamp: None,
             last_message_timestamp: time_context.now(),
             network_handler: Some(network_handler),
             next_expected_message: MessageType::Version,
@@ -119,14 +114,13 @@ impl AvalancheClient {
             status_update_receiver: status_receiver,
             status_update_sender: status_sender,
             time_context: time_context.clone(),
-            version_message_configuration: configuration.version_message,
         })
     }
 
     /// Tries to connect to the remote peer.
     pub fn connect(&mut self) -> Result<(), P2pError> {
         if let Some(handler) = self.network_handler.as_mut() {
-            handler.connect(&self.destination_address)?;
+            handler.connect(&self.configuration.destination_address)?;
         } else {
             panic!("Unexpected error: network_handler was None!");
         }
@@ -142,6 +136,12 @@ impl AvalancheClient {
         // Monitor status updates from the network handler
         loop {
             tokio::time::sleep(Duration::from_millis(100)).await;
+
+            // Check if the connection should be closed as per request
+            // of the user in the configuration.
+            if self.is_time_to_disconnect() {
+                break;
+            }
 
             // Check if the connection is stalling (remote peer
             // not sending any message for too long).
@@ -289,6 +289,14 @@ impl AvalancheClient {
                     ConnectionStatus::HandshakeCompleted(self.time_context.now().into()),
                 )?;
 
+                // Set the handshake event timestamp.
+                self.handshake_completion_timestamp = Some(SystemTime::now());
+
+                match self.configuration.connection_duration {
+                    Duration::ZERO => println!("The connection will stay alive indefinitely"),
+                    any => println!("The connection will be closed in {} seconds", any.as_secs()),
+                }
+
                 // Next message could be anything
                 self.next_expected_message = MessageType::Any;
             }
@@ -341,8 +349,10 @@ impl AvalancheClient {
     /// In case of inactivity, an error is returned so that the connection can be closed.
     fn check_inactivity(&self) -> Result<(), P2pError> {
         match self.time_context.elapsed(&self.last_message_timestamp) {
-            Ok(time) if time < self.inactivity_timeout => Ok(()),
-            Ok(_) => Err(P2pError::InactivePeer(self.inactivity_timeout)),
+            Ok(time) if time < self.configuration.inactivity_timeout => Ok(()),
+            Ok(_) => Err(P2pError::InactivePeer(
+                self.configuration.inactivity_timeout,
+            )),
             Err(error) => panic!(
                 "Fatal error, the last received message comes from the future! {}",
                 error
@@ -396,11 +406,26 @@ impl AvalancheClient {
         Ok(())
     }
 
+    /// Checks whether the connection should be closed based on the configuration of the client.
+    /// This function must return true only if the connection duration has been set (not zero)
+    /// and the handshake was completed successfully.
+    fn is_time_to_disconnect(&self) -> bool {
+        self.configuration.connection_duration != Duration::ZERO
+            && self
+                .handshake_completion_timestamp
+                .is_some_and(|timestamp| {
+                    self.time_context
+                        .elapsed(&timestamp)
+                        .unwrap_or(Duration::ZERO)
+                        > self.configuration.connection_duration
+                })
+    }
+
     /// Generates a version message to be sent for handshaking.
     fn version_message(&self) -> avalanche::message::Message {
         let mut version_message = avalanche::Version::new();
-        version_message.network_id = self.version_message_configuration.network_id;
-        version_message.my_version = self.version_message_configuration.version_string.clone();
+        version_message.network_id = self.configuration.version_message.network_id;
+        version_message.my_version = self.configuration.version_message.version_string.clone();
         version_message.my_time = self
             .time_context
             .now()
@@ -409,12 +434,12 @@ impl AvalancheClient {
             .as_secs();
         version_message.my_version_time = version_message.my_time;
         version_message.ip_addr =
-            std::net::Ipv4Addr::from_str(&self.version_message_configuration.ip_address)
+            std::net::Ipv4Addr::from_str(&self.configuration.version_message.ip_address)
                 .unwrap()
                 .to_ipv6_mapped()
                 .octets()
                 .to_vec();
-        version_message.ip_port = self.version_message_configuration.ip_port;
+        version_message.ip_port = self.configuration.version_message.ip_port;
 
         let to_sign = [
             version_message.ip_addr.clone(),
@@ -678,7 +703,7 @@ mod tests {
         client.next_expected_message = MessageType::Any;
 
         // If the default timeout is 60 seconds, let's use 29 as duration
-        let duration = Duration::from_secs(DEFAULT_INACTIVITY_TIMEOUT / 2 - 1);
+        let duration = Duration::from_secs(DEFAULT_INACTIVITY_TIMEOUT.as_secs() / 2 - 1);
 
         // Based on the duration chosen, we expect the following:
         // Iteration 1: the peer was inactive for 0 seconds  => OK
@@ -697,14 +722,14 @@ mod tests {
         // Now the peer should be inactive for 87 seconds
         assert_eq!(
             client.check_inactivity().unwrap_err(),
-            P2pError::InactivePeer(client.inactivity_timeout)
+            P2pError::InactivePeer(client.configuration.inactivity_timeout)
         );
 
         // Go back in time so that the inactivity is almost 60 seconds (minus just 1 nanosecond)
         client.time_context.set_time(
             client
                 .last_message_timestamp
-                .add(client.inactivity_timeout - Duration::from_nanos(1)),
+                .add(client.configuration.inactivity_timeout - Duration::from_nanos(1)),
         );
 
         // The peer must be considered active
@@ -718,7 +743,7 @@ mod tests {
         // The peer must be considered inactive now
         assert_eq!(
             client.check_inactivity().unwrap_err(),
-            P2pError::InactivePeer(client.inactivity_timeout)
+            P2pError::InactivePeer(client.configuration.inactivity_timeout)
         );
     }
 
@@ -792,5 +817,41 @@ mod tests {
             client.time_context.now(),
             SystemTime::UNIX_EPOCH.add(Duration::from_secs(20))
         );
+    }
+
+    /// Check that the mechanism to close the connection after a period following
+    /// the handshake completion works as expected.
+    #[test]
+    fn check_client_disconnection_trigger() {
+        // By default, the connection duration is set to zero
+        // so the disconnection should never be triggered.
+        let (mut client, _) = default_client(Some(SystemTime::UNIX_EPOCH));
+
+        // At client creation, that should obviously be false
+        assert!(!client.is_time_to_disconnect());
+
+        // Set the handshake completion timestamp
+        client.handshake_completion_timestamp = Some(SystemTime::UNIX_EPOCH);
+
+        // The disconnection should be still ignored
+        assert!(!client.is_time_to_disconnect());
+
+        // Move the clock ahead
+        client
+            .time_context
+            .set_time(client.time_context.now().add(Duration::from_secs(1000)));
+
+        // Still the check should fail
+        assert!(!client.is_time_to_disconnect());
+
+        // Now, let's enable the disconnection behavior by changing the configuration
+        client.configuration.connection_duration = Duration::from_secs(60);
+
+        // Now we are far beyond the threshold to disconnect
+        assert!(client.is_time_to_disconnect());
+
+        // Let's move the clock back and see if the check returns false again
+        client.time_context.set_time(SystemTime::UNIX_EPOCH);
+        assert!(!client.is_time_to_disconnect());
     }
 }

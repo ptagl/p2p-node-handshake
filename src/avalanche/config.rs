@@ -9,7 +9,7 @@
 /// or the default one.
 /// Finally, the remaining [`CommandLineArguments`] are parsed and they
 /// eventually overwrite the YAML configuration.
-use std::{error::Error, fs::File, io::Read};
+use std::{error::Error, fs::File, io::Read, time::Duration};
 
 use clap::Parser;
 use serde::Deserialize;
@@ -19,11 +19,15 @@ use super::{DEFAULT_INACTIVITY_TIMEOUT, DEFAULT_IP_ADDRESS};
 /// Struct containing the configuration for the Avalanche client
 #[derive(Debug, Deserialize, PartialEq)]
 pub struct Configuration {
+    /// How long the application should stay connected after a successful handshake.
+    /// At the moment, this cannot be set from YAML.
+    pub connection_duration: Duration,
+
     /// Destination IP (format is [address]:[port]) of the peer to which we want to connect to.
     pub destination_address: String,
 
     /// Timeout after which connections are closed if no messages are received.
-    pub inactivity_timeout: u64,
+    pub inactivity_timeout: Duration,
 
     /// Configuration of the fields included in the Version message sent during the handshake.
     pub version_message: VersionMessage,
@@ -65,6 +69,11 @@ impl Configuration {
     /// Updates the configuration by overwriting fields found by Clap
     /// as command line arguments.
     fn update_from_args(&mut self, args: CommandLineArguments) {
+        // Check the presence of a value for the connetion duration
+        if let Some(value) = args.connection_duration {
+            self.connection_duration = value;
+        }
+
         // Check the presence of a value for the IP [address]:[port] argument
         if let Some(value) = args.ip_address {
             self.destination_address = value;
@@ -80,6 +89,7 @@ impl Configuration {
 impl Default for Configuration {
     fn default() -> Self {
         Self {
+            connection_duration: Duration::ZERO,
             destination_address: String::from(DEFAULT_IP_ADDRESS),
             inactivity_timeout: DEFAULT_INACTIVITY_TIMEOUT,
             version_message: VersionMessage {
@@ -115,8 +125,14 @@ pub struct VersionMessage {
 #[command(author, version, about, long_about = None)]
 struct CommandLineArguments {
     /// Path to the YAML configuration file.
-    /// #[arg(short, long)]
+    #[arg(short, long)]
     configuration_file_path: Option<String>,
+
+    /// How long the connection should be kept alive after a successful
+    /// handshake procedure.
+    #[arg(long)]
+    #[clap(value_parser = |secs: &str| secs.parse().map(Duration::from_secs))]
+    connection_duration: Option<Duration>,
 
     /// IP address of the destination peer as [ADDRESS]:[PORT].
     #[arg(short, long)]
@@ -124,11 +140,14 @@ struct CommandLineArguments {
 
     /// Inactivity timeout for P2P communications (seconds).
     #[arg(short, long)]
-    timeout: Option<u64>,
+    #[clap(value_parser = |secs: &str| secs.parse().map(Duration::from_secs))]
+    timeout: Option<Duration>,
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::{CommandLineArguments, Configuration};
 
     /// Checks that the configuration file read from YAML file is correctly
@@ -161,7 +180,7 @@ mod tests {
         );
 
         // Let's set the inactivity timeout
-        args.timeout = Some(7);
+        args.timeout = Some(Duration::from_secs(7));
         configuration.update_from_args(args.clone());
         assert_ne!(default_configuration, configuration);
         assert_eq!(configuration.inactivity_timeout, args.timeout.unwrap());
